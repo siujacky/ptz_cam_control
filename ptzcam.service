@@ -1,0 +1,28 @@
+[Unit]
+Description=PTZ Cam - local AI object-tracking camera
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/ptz_cam
+Environment=HAILORT_LOGGER_PATH=NONE
+Environment=PYTHONUNBUFFERED=1
+# Large per-frame buffers: a fixed mmap threshold hands them straight back to the OS instead of
+# letting glibc's heap creep; two arenas are plenty for this workload.
+Environment=MALLOC_MMAP_THRESHOLD_=1048576
+Environment=MALLOC_ARENA_MAX=2
+# RAM ring buffer in /run/ptzcam: systemd owns it, logind's RemoveIPC cannot wipe it on logout, and it
+# survives service restarts (so pending clips can still be cut) until the next reboot.
+RuntimeDirectory=ptzcam
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/home/pi/ptz_cam/.venv/bin/python -m ptzcam --segment-dir /run/ptzcam
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

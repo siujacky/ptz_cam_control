@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0a0e16">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="description" content="Local AI security camera: live view, timeline and statistics">
+  <title>PTZ Camera</title>
+  <link rel="icon" type="image/svg+xml" href="/static/img/favicon.svg">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script type="module" src="/static/js/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><i data-icon="lens"></i></span>
+        <span class="brand-text">
+          <span class="brand-name" id="cam-name">Camera</span>
+          <span class="conn" id="conn" role="status"><span class="conn-dot" aria-hidden="true"></span><span id="conn-text">Connecting…</span></span>
+        </span>
+      </div>
+      <nav class="tabbar" aria-label="Sections">
+        <a class="tab-link" href="#live" data-tab="live"><i data-icon="live"></i><span>Live</span></a>
+        <a class="tab-link" href="#history" data-tab="history"><i data-icon="history"></i><span>History</span></a>
+        <a class="tab-link" href="#stats" data-tab="stats"><i data-icon="stats"></i><span>Stats</span></a>
+        <a class="tab-link" href="#settings" data-tab="settings"><i data-icon="settings"></i><span>Settings</span></a>
+      </nav>
+      <time class="clock" id="clock"></time>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" role="alert" hidden>
+    <i data-icon="offline"></i>
+    <span class="banner-text" id="banner-text">Can't reach the camera server. Retrying…</span>
+    <button class="btn btn-sm" id="banner-retry" type="button">Retry now</button>
+  </div>
+
+  <main id="main" tabindex="-1">
+    <noscript><p class="noscript">This app needs JavaScript.</p></noscript>
+
+    <!-- ============================== LIVE ============================== -->
+    <section class="tab-panel" id="tab-live" data-panel="live" aria-labelledby="live-title" hidden>
+      <h1 class="sr-only" id="live-title">Live view</h1>
+      <div class="live-grid">
+        <div class="live-main">
+          <div class="stage" id="stage">
+            <canvas class="stage-poster" id="live-poster" aria-hidden="true"></canvas>
+            <img class="stage-img" id="live-img" alt="Live camera view" decoding="async">
+            <canvas class="stage-canvas" id="live-canvas" aria-hidden="true"></canvas>
+            <div class="stage-loading" id="stage-loading" aria-hidden="true"><span class="spinner"></span></div>
+            <div class="stage-msg" id="stage-msg" hidden>
+              <i data-icon="camera-off"></i>
+              <strong id="stage-msg-title">Camera offline</strong>
+              <span id="stage-msg-text">Trying to reconnect…</span>
+            </div>
+            <div class="stage-top">
+              <span class="live-badge" id="live-badge"><span class="live-dot" aria-hidden="true"></span><span id="live-badge-text">Live</span><span class="live-fps" id="live-fps"></span></span>
+              <span class="night-badge" id="night-badge" hidden title="Night vision: the AI HAT brightens the dark picture (Zero-DCE)"><i data-icon="moon"></i>Night vision</span>
+              <span class="night-badge bright-badge" id="bright-badge" hidden><i data-icon="sun"></i><span id="bright-badge-text">Auto brightness</span></span>
+              <span class="stage-spacer"></span>
+              <button class="icon-btn glass" id="btn-overlay" type="button" aria-pressed="true" title="Detection boxes"><i data-icon="boxes"></i><span class="sr-only">Detection boxes</span></button>
+              <button class="icon-btn glass" id="btn-fullscreen" type="button" title="Fullscreen"><i data-icon="expand"></i><span class="sr-only" id="fs-label">Enter fullscreen</span></button>
+            </div>
+            <div class="stage-toast" id="stage-toast" aria-hidden="true" hidden></div>
+          </div>
+          <div class="live-status">
+            <span class="ptz-line" id="ptz-line"><i data-icon="target"></i><span id="ptz-line-text">Watching (wide)</span></span>
+            <span class="warn-chips" id="warn-chips"></span>
+          </div>
+          <div class="inview" id="inview">
+            <span class="inview-label"><span class="inview-dot" aria-hidden="true"></span>In view now</span>
+            <span class="inview-chips" id="inview-chips"><span class="inview-none">Nothing detected</span></span>
+          </div>
+          <section class="card today-card" aria-labelledby="today-title">
+            <div class="card-head">
+              <h2 class="card-title" id="today-title">Today</h2>
+              <a class="card-link" href="#stats">Stats<i data-icon="chevron-right"></i></a>
+            </div>
+            <div class="today-grid" id="today-grid"></div>
+          </section>
+        </div>
+
+        <aside class="live-side">
+          <section class="card ptz-card" id="ptz-card" aria-labelledby="ptz-title">
+            <div class="card-head">
+              <h2 class="card-title" id="ptz-title">Camera control</h2>
+              <span class="pill" id="ptz-pill">PTZ</span>
+            </div>
+            <div class="ptz-controls">
+              <div class="dpad" id="dpad" role="group" aria-label="Pan and tilt" aria-describedby="dpad-hint">
+                <button type="button" class="dpad-btn diag" data-pan="-1" data-tilt="1" aria-label="Up left"><i data-icon="arrow" class="rot-315"></i></button>
+                <button type="button" class="dpad-btn" data-pan="0" data-tilt="1" aria-label="Up"><i data-icon="arrow"></i></button>
+                <button type="button" class="dpad-btn diag" data-pan="1" data-tilt="1" aria-label="Up right"><i data-icon="arrow" class="rot-45"></i></button>
+                <button type="button" class="dpad-btn" data-pan="-1" data-tilt="0" aria-label="Left"><i data-icon="arrow" class="rot-270"></i></button>
+                <button type="button" class="dpad-home" id="btn-home" aria-label="Home position" title="Home position"><i data-icon="home"></i></button>
+                <button type="button" class="dpad-btn" data-pan="1" data-tilt="0" aria-label="Right"><i data-icon="arrow" class="rot-90"></i></button>
+                <button type="button" class="dpad-btn diag" data-pan="-1" data-tilt="-1" aria-label="Down left"><i data-icon="arrow" class="rot-225"></i></button>
+                <button type="button" class="dpad-btn" data-pan="0" data-tilt="-1" aria-label="Down"><i data-icon="arrow" class="rot-180"></i></button>
+                <button type="button" class="dpad-btn diag" data-pan="1" data-tilt="-1" aria-label="Down right"><i data-icon="arrow" class="rot-135"></i></button>
+              </div>
+              <div class="zoom-col" role="group" aria-label="Zoom">
+                <button type="button" class="zoom-btn" data-zoom="in" aria-label="Zoom in" title="Zoom in"><i data-icon="plus"></i></button>
+                <span class="zoom-label" aria-hidden="true"><i data-icon="zoom"></i></span>
+                <button type="button" class="zoom-btn" data-zoom="out" aria-label="Zoom out" title="Zoom out"><i data-icon="minus"></i></button>
+              </div>
+            </div>
+            <p class="hint center" id="dpad-hint">Press and hold to move. Arrow keys work when the pad has focus.</p>
+            <div class="range-field">
+              <div class="field-top"><label for="ptz-speed">Speed</label><output id="ptz-speed-out" for="ptz-speed">50%</output></div>
+              <input type="range" id="ptz-speed" min="0.1" max="1" step="0.05" value="0.5">
+            </div>
+            <div class="presets">
+              <div class="field-top"><span id="presets-label">Presets</span><span class="hint-inline" id="preset-hint">Tap to go</span></div>
+              <div class="preset-grid" id="preset-grid" role="group" aria-labelledby="presets-label"></div>
+            </div>
+            <div class="home-set">
+              <div class="field-top"><span id="home-label">Home position</span><span class="hint-inline" id="home-hint">Camera default</span></div>
+              <div class="home-actions" role="group" aria-labelledby="home-label">
+                <button type="button" class="btn btn-sm" id="btn-set-home"><i data-icon="pin"></i>Set current view as Home</button>
+                <button type="button" class="btn btn-sm btn-ghost" id="btn-reset-home" hidden><i data-icon="undo"></i>Use camera default</button>
+              </div>
+            </div>
+            <div class="switch-list">
+              <label class="switch-row">
+                <span class="switch-text"><span class="switch-title">Auto-follow</span><span class="switch-sub">Follow a moving object. Tap a box in the live view to pick one.</span></span>
+                <input type="checkbox" role="switch" class="switch" id="sw-follow">
+              </label>
+              <label class="switch-row">
+                <span class="switch-text"><span class="switch-title">Auto-zoom</span><span class="switch-sub">Zoom in on the object being followed</span></span>
+                <input type="checkbox" role="switch" class="switch" id="sw-zoom">
+              </label>
+              <label class="switch-row">
+                <span class="switch-text"><span class="switch-title">Auto-focus after moves</span><span class="switch-sub">Refocus once the camera stops moving</span></span>
+                <input type="checkbox" role="switch" class="switch" id="sw-focus">
+              </label>
+            </div>
+          </section>
+        </aside>
+
+        <section class="card recent-card" aria-labelledby="recent-title">
+          <div class="card-head">
+            <h2 class="card-title" id="recent-title">Recent activity</h2>
+            <a class="card-link" href="#history">History<i data-icon="chevron-right"></i></a>
+          </div>
+          <div class="recent-grid" id="recent-grid"></div>
+        </section>
+      </div>
+    </section>
+
+    <!-- ============================== HISTORY ============================== -->
+    <section class="tab-panel" id="tab-history" data-panel="history" aria-labelledby="history-title" hidden>
+      <div class="page-head">
+        <h1 class="page-title" id="history-title">History</h1>
+      </div>
+      <div class="history-toolbar">
+        <div class="day-nav" role="group" aria-label="Day">
+          <button type="button" class="icon-btn" id="day-prev" aria-label="Previous day with activity"><i data-icon="chevron-left"></i></button>
+          <button type="button" class="day-btn" id="day-btn" aria-describedby="day-btn-hint">
+            <span class="day-main" id="day-main">Today</span>
+            <span class="day-sub" id="day-sub"></span>
+          </button>
+          <span class="sr-only" id="day-btn-hint">Opens a date picker</span>
+          <input type="date" class="day-input" id="day-input" tabindex="-1" aria-label="Choose a day">
+          <button type="button" class="icon-btn" id="day-next" aria-label="Next day with activity"><i data-icon="chevron-right"></i></button>
+          <button type="button" class="btn btn-sm btn-ghost" id="day-today">Today</button>
+        </div>
+        <div class="chips" id="hist-chips" role="group" aria-label="Filter by category"></div>
+      </div>
+      <section class="card timeline-card" aria-labelledby="tl-title">
+        <div class="card-head">
+          <h2 class="card-title" id="tl-title">Timeline</h2>
+          <span class="card-sub" id="tl-sub"></span>
+          <span class="tl-zoom" role="group" aria-label="Timeline zoom">
+            <button type="button" class="icon-btn sm" id="tl-zoom-out" aria-label="Zoom timeline out"><i data-icon="minus"></i></button>
+            <button type="button" class="icon-btn sm" id="tl-zoom-in" aria-label="Zoom timeline in"><i data-icon="plus"></i></button>
+          </span>
+        </div>
+        <div class="tl-scroll" id="tl-scroll">
+          <div class="tl-track" id="tl-track">
+            <div class="tl-bar" id="tl-bar"></div>
+            <div class="tl-hours" id="tl-hours" aria-hidden="true"></div>
+          </div>
+        </div>
+        <div class="tl-tip" id="tl-tip" role="tooltip" hidden></div>
+      </section>
+      <div class="event-list" id="event-list"></div>
+      <div class="list-foot">
+        <button type="button" class="btn" id="load-more" hidden>Load more</button>
+      </div>
+    </section>
+
+    <!-- ============================== STATS ============================== -->
+    <section class="tab-panel" id="tab-stats" data-panel="stats" aria-labelledby="stats-title" hidden>
+      <div class="page-head">
+        <h1 class="page-title" id="stats-title">Stats</h1>
+        <div class="seg" id="stats-range" role="group" aria-label="Time range">
+          <button type="button" data-range="day" aria-pressed="true">Today</button>
+          <button type="button" data-range="week" aria-pressed="false">7 days</button>
+          <button type="button" data-range="month" aria-pressed="false">30 days</button>
+        </div>
+      </div>
+      <div class="stats-body" id="stats-body">
+        <div class="kpis" id="kpis"></div>
+        <section class="card chart-card" aria-labelledby="chart-title">
+          <div class="card-head">
+            <h2 class="card-title" id="chart-title">Passers-by</h2>
+            <span class="card-sub" id="chart-sub"></span>
+          </div>
+          <div class="legend" id="chart-legend" role="group" aria-label="Show or hide categories"></div>
+          <div class="chart" id="chart" tabindex="0" role="group" aria-roledescription="chart" aria-label="Stacked bar chart of passers-by. Use the left and right arrow keys to read each bar."></div>
+          <details class="table-view">
+            <summary>Show as table</summary>
+            <div class="table-wrap" id="chart-table"></div>
+          </details>
+        </section>
+        <div class="stats-grid">
+          <section class="card heat-card" aria-labelledby="heat-title">
+            <div class="card-head">
+              <h2 class="card-title" id="heat-title">Activity by time</h2>
+              <label class="select-wrap sm"><span class="sr-only">Category for heatmap and busiest hour</span>
+                <select id="heat-cat"><option value="">All categories</option></select>
+              </label>
+            </div>
+            <div class="heatmap" id="heatmap"></div>
+            <div class="busiest" id="busiest"></div>
+          </section>
+          <section class="card dir-card" aria-labelledby="dir-title">
+            <div class="card-head">
+              <h2 class="card-title" id="dir-title">Direction</h2>
+              <span class="card-sub">Which way they went</span>
+            </div>
+            <div class="dir-list" id="dir-list"></div>
+          </section>
+        </div>
+      </div>
+      <div class="chart-tip" id="chart-tip" role="tooltip" hidden></div>
+    </section>
+
+    <!-- ============================== SETTINGS ============================== -->
+    <section class="tab-panel" id="tab-settings" data-panel="settings" aria-labelledby="settings-title" hidden>
+      <div class="page-head">
+        <h1 class="page-title" id="settings-title">Settings</h1>
+      </div>
+      <div class="state-box" id="settings-state"></div>
+      <form class="settings-grid" id="settings-form" novalidate hidden>
+        <div class="settings-col">
+          <section class="card s-detect" aria-labelledby="s-detect-title">
+            <div class="card-head"><h2 class="card-title" id="s-detect-title">Detection</h2></div>
+            <div class="cat-settings" id="cat-settings"></div>
+            <div class="range-field">
+              <div class="field-top"><label for="f-min-move">Minimum movement</label><output data-out="detect.min_move"></output></div>
+              <input type="range" id="f-min-move" data-path="detect.min_move" data-type="float" min="0.1" max="2" step="0.05">
+              <p class="hint">How far an object must travel, in multiples of its own size, before it counts. Higher values ignore jitter.</p>
+            </div>
+            <div class="field">
+              <label for="f-model">Model</label>
+              <span class="select-wrap"><select id="f-model" data-path="detect.model" data-type="string"></select></span>
+              <p class="hint">Changing the model restarts detection for a few seconds.</p>
+            </div>
+          </section>
+
+          <section class="card s-night" aria-labelledby="s-night-title">
+            <div class="card-head">
+              <h2 class="card-title" id="s-night-title">Night vision</h2>
+              <span class="pill" id="night-pill">Off</span>
+            </div>
+            <div class="field">
+              <label for="f-ll-mode">When to use it</label>
+              <span class="select-wrap"><select id="f-ll-mode" data-path="lowlight.mode" data-type="string">
+                <option value="auto">Automatically, when it gets dark</option>
+                <option value="on">Always</option>
+                <option value="off">Never</option>
+              </select></span>
+              <p class="hint">This camera has no infrared mode, so the AI HAT brightens dark scenes with Zero-DCE. The live view, snapshots and night clips show the brightened picture.</p>
+            </div>
+            <div class="field">
+              <label for="f-ll-model">Model</label>
+              <span class="select-wrap"><select id="f-ll-model" data-path="lowlight.model" data-type="string"></select></span>
+            </div>
+            <label class="switch-row">
+              <span class="switch-text"><span class="switch-title">Detect on the brightened picture</span><span class="switch-sub">Look for passers-by in the night-vision view instead of the dark original</span></span>
+              <input type="checkbox" role="switch" class="switch" id="f-ll-detect" data-path="lowlight.detect" data-type="bool">
+            </label>
+            <label class="switch-row">
+              <span class="switch-text"><span class="switch-title">Save night-vision clips</span><span class="switch-sub">A brightened copy of each night event's clip, kept next to the original</span></span>
+              <input type="checkbox" role="switch" class="switch" id="f-ll-clips" data-path="lowlight.save_clips" data-type="bool">
+            </label>
+            <p class="hint" id="night-status" aria-live="polite"></p>
+          </section>
+
+          <section class="card s-bright" aria-labelledby="s-bright-title">
+            <div class="card-head">
+              <h2 class="card-title" id="s-bright-title">Auto brightness</h2>
+              <span class="pill" id="bright-pill">Off</span>
+            </div>
+            <label class="switch-row">
+              <span class="switch-text"><span class="switch-title">Fix washed-out pictures</span><span class="switch-sub">When sun on the window fades the picture towards white, stretch what is left back to full contrast in the live view and photos</span></span>
+              <input type="checkbox" role="switch" class="switch" id="f-br-auto" data-path="brightness.auto" data-type="bool">
+            </label>
+            <label class="switch-row">
+              <span class="switch-text"><span class="switch-title">Detect on the corrected picture</span><span class="switch-sub">Look for passers-by in the corrected picture. On hazy mornings it found 20 % more, with the same counts</span></span>
+              <input type="checkbox" role="switch" class="switch" id="f-br-detect" data-path="brightness.detect" data-type="bool">
+            </label>
+            <p class="hint">The camera has no exposure setting the app can reach. Once the picture is fully white nothing is left to recover: shade the camera from direct sun.</p>
+            <p class="hint" id="bright-status" aria-live="polite"></p>
+          </section>
+
+          <section class="card s-rec" aria-labelledby="s-rec-title">
+            <div class="card-head"><h2 class="card-title" id="s-rec-title">Recording and storage</h2></div>
+            <div class="range-field">
+              <div class="field-top"><label for="f-clip">Clip length</label><output data-out="events.clip_seconds"></output></div>
+              <input type="range" id="f-clip" data-path="events.clip_seconds" data-type="int" data-format="sec" min="10" max="60" step="1">
+            </div>
+            <div class="range-field">
+              <div class="field-top"><label for="f-preroll">Pre-roll</label><output data-out="events.preroll_seconds"></output></div>
+              <input type="range" id="f-preroll" data-path="events.preroll_seconds" data-type="int" data-format="sec" min="0" max="10" step="1">
+              <p class="hint">Seconds of video kept from before the object was counted.</p>
+            </div>
+            <div class="field-pair">
+              <div class="field">
+                <label for="f-retention">Keep events for</label>
+                <span class="input-unit"><input type="number" inputmode="numeric" id="f-retention" data-path="storage.retention_days" data-type="int" min="1" max="365" step="1"><span>days</span></span>
+              </div>
+              <div class="field">
+                <label for="f-maxgb">Storage cap</label>
+                <span class="input-unit"><input type="number" inputmode="numeric" id="f-maxgb" data-path="storage.max_storage_gb" data-type="int" min="1" max="2000" step="1"><span>GB</span></span>
+              </div>
+            </div>
+            <p class="hint" id="storage-hint">Oldest events are removed first when either limit is reached. Counts are kept.</p>
+          </section>
+
+          <section class="card s-cam" aria-labelledby="s-cam-title">
+            <div class="card-head"><h2 class="card-title" id="s-cam-title">Camera</h2></div>
+            <div class="field">
+              <label for="f-name">Name</label>
+              <input type="text" id="f-name" data-path="camera.name" data-type="string" maxlength="40" autocomplete="off" spellcheck="false">
+            </div>
+            <details class="advanced">
+              <summary>Advanced: stream and PTZ connection</summary>
+              <div class="field">
+                <label for="f-rtsp">RTSP URL</label>
+                <input type="text" id="f-rtsp" data-path="camera.rtsp_url" data-type="string" inputmode="url" autocomplete="off" spellcheck="false">
+                <p class="hint">Changing the stream restarts the pipeline.</p>
+              </div>
+              <div class="field-pair">
+                <div class="field">
+                  <label for="f-vhost">VISCA host</label>
+                  <input type="text" id="f-vhost" data-path="camera.visca_host" data-type="string" autocomplete="off" spellcheck="false">
+                </div>
+                <div class="field">
+                  <label for="f-vport">VISCA port</label>
+                  <input type="number" inputmode="numeric" id="f-vport" data-path="camera.visca_port" data-type="int" min="1" max="65535" step="1">
+                </div>
+              </div>
+            </details>
+          </section>
+        </div>
+
+        <div class="settings-col">
+          <section class="card s-zone zone-card" aria-labelledby="s-zone-title">
+            <div class="card-head">
+              <h2 class="card-title" id="s-zone-title">Detection zone</h2>
+              <span class="pill" id="zone-pill">Whole frame</span>
+            </div>
+            <p class="hint">Click or tap the frame to add corners, drag a corner to move it. Objects count only when their feet enter the zone. No zone means the whole frame.</p>
+            <div class="zone-stage" id="zone-stage">
+              <img class="zone-img" id="zone-img" alt="Current camera frame for drawing the detection zone">
+              <svg class="zone-svg" id="zone-svg" viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true">
+                <path class="zone-dim" id="zone-dim" fill-rule="evenodd" d=""></path>
+                <polygon class="zone-poly" id="zone-poly" points=""></polygon>
+                <polyline class="zone-line" id="zone-line" points=""></polyline>
+              </svg>
+              <div class="zone-handles" id="zone-handles"></div>
+              <div class="zone-msg" id="zone-msg" hidden></div>
+            </div>
+            <div class="zone-actions">
+              <button type="button" class="btn btn-sm" id="zone-undo"><i data-icon="undo"></i>Undo</button>
+              <button type="button" class="btn btn-sm" id="zone-clear"><i data-icon="clear"></i>Clear</button>
+              <button type="button" class="btn btn-sm" id="zone-refresh"><i data-icon="refresh"></i>New frame</button>
+              <span class="grow"></span>
+              <button type="button" class="btn btn-sm btn-primary" id="zone-save"><i data-icon="check"></i>Save zone</button>
+            </div>
+          </section>
+
+          <section class="card s-follow" aria-labelledby="s-follow-title">
+            <div class="card-head"><h2 class="card-title" id="s-follow-title">Auto-follow</h2></div>
+            <fieldset class="field">
+              <legend>Follow these categories</legend>
+              <div class="check-chips" id="follow-cats"></div>
+              <p class="hint">People come first. Anything crossing faster than the camera can turn, like most passing cars, is not chased.</p>
+            </fieldset>
+            <div class="range-field">
+              <div class="field-top"><label for="f-deadzone">Dead zone</label><output data-out="ptz.deadzone"></output></div>
+              <input type="range" id="f-deadzone" data-path="ptz.deadzone" data-type="float" data-format="pct" min="0.02" max="0.4" step="0.01">
+              <p class="hint">How far from centre the object may drift before the camera moves.</p>
+            </div>
+            <div class="field-pair stack-sm">
+              <div class="range-field">
+                <div class="field-top"><label for="f-pan">Max pan speed</label><output data-out="ptz.max_pan_speed"></output></div>
+                <input type="range" id="f-pan" data-path="ptz.max_pan_speed" data-type="int" min="1" max="24" step="1">
+              </div>
+              <div class="range-field">
+                <div class="field-top"><label for="f-tilt">Max tilt speed</label><output data-out="ptz.max_tilt_speed"></output></div>
+                <input type="range" id="f-tilt" data-path="ptz.max_tilt_speed" data-type="int" min="1" max="20" step="1">
+              </div>
+            </div>
+            <div class="field-pair">
+              <div class="field">
+                <label for="f-rethome">Return home after</label>
+                <span class="input-unit"><input type="number" inputmode="numeric" id="f-rethome" data-path="ptz.return_home_seconds" data-type="int" min="0" max="600" step="1"><span>s</span></span>
+              </div>
+              <div class="field">
+                <label for="f-homepreset">Home preset</label>
+                <input type="number" inputmode="numeric" id="f-homepreset" data-path="ptz.home_preset" data-type="int" min="0" max="254" step="1" aria-describedby="homepreset-hint">
+              </div>
+            </div>
+            <p class="hint" id="homepreset-hint">Return home: how long to look for a lost person; a lost vehicle goes back at once. Preset 0 is the camera's own Home position.</p>
+            <label class="switch-row">
+              <span class="switch-text"><span class="switch-title">Auto-zoom</span><span class="switch-sub">Zoom in on the followed object</span></span>
+              <input type="checkbox" role="switch" class="switch" id="f-autozoom" data-path="ptz.autozoom" data-type="bool">
+            </label>
+            <div class="range-field">
+              <div class="field-top"><label for="f-target">Target size</label><output data-out="ptz.target_size"></output></div>
+              <input type="range" id="f-target" data-path="ptz.target_size" data-type="float" data-format="pct" min="0.1" max="0.8" step="0.01">
+              <p class="hint">Object height, as a share of the frame, that auto-zoom aims for.</p>
+            </div>
+            <div class="range-field">
+              <div class="field-top"><label for="f-maxzoom">Max zoom position</label><output data-out="ptz.max_zoom_pos"></output></div>
+              <input type="range" id="f-maxzoom" data-path="ptz.max_zoom_pos" data-type="int" min="0" max="16384" step="256">
+              <p class="hint">Auto-zoom measures the object and moves the lens straight to the right zoom, so it does not overshoot.</p>
+            </div>
+          </section>
+
+          <section class="card s-sys" aria-labelledby="s-sys-title">
+            <div class="card-head">
+              <h2 class="card-title" id="s-sys-title">System</h2>
+              <span class="card-sub" id="sys-version"></span>
+            </div>
+            <dl class="sys-grid" id="sys-grid"></dl>
+          </section>
+        </div>
+      </form>
+      <div class="savebar" id="savebar" hidden>
+        <span class="savebar-text" id="savebar-text" role="status">Unsaved changes</span>
+        <button type="button" class="btn btn-ghost" id="settings-discard">Discard</button>
+        <button type="button" class="btn btn-primary" id="settings-save">Save</button>
+      </div>
+    </section>
+  </main>
+
+  <!-- ============================== EVENT VIEWER ============================== -->
+  <dialog class="viewer" id="viewer" aria-labelledby="viewer-title">
+    <div class="viewer-inner">
+      <header class="viewer-head">
+        <div class="viewer-titles">
+          <h2 class="viewer-title" id="viewer-title">Event</h2>
+          <p class="viewer-sub" id="viewer-sub"></p>
+        </div>
+        <span class="viewer-count" id="viewer-count" aria-live="polite"></span>
+        <button type="button" class="icon-btn" id="viewer-close" aria-label="Close"><i data-icon="close"></i></button>
+      </header>
+      <div class="viewer-media" id="viewer-media">
+        <img class="viewer-img" id="viewer-img" alt="">
+        <video class="viewer-video" id="viewer-video" controls autoplay muted playsinline preload="auto" hidden></video>
+        <div class="viewer-overlay" id="viewer-overlay" hidden>
+          <span class="spinner" id="viewer-spinner"></span>
+          <span id="viewer-overlay-text">Processing clip…</span>
+        </div>
+        <button type="button" class="nav-btn prev" id="viewer-prev" aria-label="Older event" title="Older (←)"><i data-icon="chevron-left"></i></button>
+        <button type="button" class="nav-btn next" id="viewer-next" aria-label="Newer event" title="Newer (→)"><i data-icon="chevron-right"></i></button>
+      </div>
+      <div class="viewer-side">
+        <div class="viewer-bar">
+          <div class="seg sm" role="group" aria-label="Show">
+            <button type="button" id="vm-video" aria-pressed="true"><i data-icon="video"></i>Video</button>
+            <button type="button" id="vm-snap" aria-pressed="false"><i data-icon="image"></i>Snapshot</button>
+          </div>
+          <button type="button" class="btn btn-sm night-toggle" id="vm-night" aria-pressed="true" hidden title="Switch between the night-vision clip and the camera's original"><i data-icon="moon"></i>Night vision</button>
+        </div>
+        <div class="viewer-chips" id="viewer-chips"></div>
+        <h3 class="viewer-h3">Objects</h3>
+        <ul class="obj-list" id="obj-list"></ul>
+        <div class="viewer-actions">
+          <a class="btn btn-sm" id="dl-mp4" download><i data-icon="download"></i>MP4</a>
+          <a class="btn btn-sm" id="dl-jpg" download><i data-icon="download"></i>JPG</a>
+          <span class="grow"></span>
+          <button type="button" class="btn btn-sm btn-danger" id="viewer-delete"><i data-icon="trash"></i>Delete</button>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="confirm" id="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-msg">
+    <form method="dialog" class="confirm-inner">
+      <h2 class="confirm-title" id="confirm-title">Are you sure?</h2>
+      <p class="confirm-msg" id="confirm-msg"></p>
+      <div class="confirm-actions">
+        <button type="submit" class="btn" value="cancel" id="confirm-cancel">Cancel</button>
+        <button type="submit" class="btn btn-danger-solid" value="ok" id="confirm-ok">OK</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>

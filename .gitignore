@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# This installation's settings (camera and web passwords), recordings and database
+config.json
+config.json.tmp
+data/
+
+# Hailo model files: downloaded from the Hailo Model Zoo (see README, "Installing")
+models/
+
+# Logs
+hailort.log
+*.log
