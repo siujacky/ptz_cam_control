@@ -62,11 +62,12 @@ This is a conference-room camera (ClearOne UNITE 200). In bright daylight its au
 **Anti-flicker test (USB cable).** The one exposure-related setting this camera offers is anti-flicker, and only over its USB port.
 - It was set to 50 Hz. Anti-flicker stops mains lighting from flickering on video by keeping the shutter at 1/100 s or slower. That is fine indoors, but in sunshine it can let in far too much light.
 - To test whether it causes the white-out, it was switched **off** on 31 October at 18:00. If bright days still turn white, it isn't the cause. If night pictures start to flicker under street lights, set it back to 50 Hz.
+- On the morning of 1 November the camera restarted (its USB connection dropped and came back), and the setting went back to 50 Hz, so that day was not a test.
 - Keep the camera's USB cable plugged into the Pi. The network cable is still needed for everything else (see *Camera notes*).
-- Check or change it as `pi`, from this folder. A camera restart may put it back to 50 Hz.
+- Check or change it as `pi`, from this folder. A camera restart puts it back to 50 Hz. `--camera unite` makes sure it is this camera, not another USB camera.
   ```bash
-  .venv/bin/python tools/uvc_controls.py get power_line_frequency     # 0 = off, 1 = 50 Hz, 2 = 60 Hz
-  .venv/bin/python tools/uvc_controls.py set power_line_frequency=1   # back to 50 Hz
+  .venv/bin/python tools/uvc_controls.py --camera unite get power_line_frequency     # 0 = off, 1 = 50 Hz, 2 = 60 Hz
+  .venv/bin/python tools/uvc_controls.py --camera unite set power_line_frequency=0   # off (1 = back to 50 Hz)
   ```
 
 ## Night vision
@@ -182,7 +183,7 @@ Retention: events older than 30 days are deleted automatically, and so are the o
 .venv/bin/python tools/eval_lowlight.py CLIP... --out /tmp/eval --start 3 --duration 8  # detector input: raw vs night vision or auto brightness
 .venv/bin/python tools/mock_server.py --port 8090                                       # UI with fake data
 python tools/ui_smoke.py --base http://127.0.0.1:8090 --out /tmp/shots                  # headless browser checks (needs Playwright)
-.venv/bin/python tools/uvc_controls.py                                                 # the camera's USB picture controls
+.venv/bin/python tools/uvc_controls.py [--camera NAME]                                 # USB cameras' picture controls
 ```
 
 **Measuring the zoom lens.** Do this once, with a clear daytime picture: not white, and not dark. It takes about 2 minutes with the app stopped:

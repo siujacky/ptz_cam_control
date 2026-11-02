@@ -183,7 +183,8 @@ These notes cover building and running PTZ Cam. The setup is a Raspberry Pi 5 wi
 ## 7. Open items
 
 - **Anti-flicker verdict.**
-  - Compare 1 November's daytime clips (about 10:00–14:00) with 31 October's, and check the night clips for flicker.
+  - It hasn't been tested yet. The camera restarted on the morning of 1 November, and that put anti-flicker back to 50 Hz. A camera restart undoes it, so the app should re-apply it whenever the camera reconnects.
+  - Once it is applied, compare a bright day's clips (about 10:00–14:00) with 31 October's, and check the night clips for flicker.
   - If it works, have the app switch it automatically: off by day, 50 Hz at night. If it doesn't, set it back to 50 Hz.
 - **Measure the lens** with `tools/calibrate_zoom.py` on a clear picture. Then check live person follows:
   - overshoot at most 1.2×;

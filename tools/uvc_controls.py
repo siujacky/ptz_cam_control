@@ -1,16 +1,18 @@
 """Read and set the camera's USB (UVC) picture controls, such as anti-flicker (`power_line_frequency`).
 
     .venv/bin/python tools/uvc_controls.py                                 every control: range, default, value
-    .venv/bin/python tools/uvc_controls.py get power_line_frequency
-    .venv/bin/python tools/uvc_controls.py set power_line_frequency=0      0 = off, 1 = 50 Hz, 2 = 60 Hz
+    .venv/bin/python tools/uvc_controls.py --camera unite get power_line_frequency
+    .venv/bin/python tools/uvc_controls.py --camera unite set power_line_frequency=0      0 = off, 1 = 50 Hz, 2 = 60 Hz
 
-The camera's USB port must be connected to the Pi. Its video node is found by itself (the first uvcvideo node,
-or pass --device /dev/videoN). Only control requests are sent: nothing is streamed over USB, and the app keeps
+The camera's USB port must be connected to the Pi. --camera picks a camera by name (node numbers can change after a
+reboot or re-plug); without it the first USB camera is used, or pass --device /dev/videoN. A refused value is
+reported and the exit code is 1. Only control requests are sent: nothing is streamed over USB, and the app keeps
 using the camera's network stream. The camera has no exposure, shutter or gain control here (nor over VISCA, its
 web page or ONVIF); anti-flicker is the one exposure-related setting. A camera restart may put values back.
 Plain ioctls, so v4l-utils is not needed.
 """
 import argparse
+import errno
 import fcntl
 import os
 import struct
@@ -27,14 +29,24 @@ MFMT = "II32sI"  # struct v4l2_querymenu
 TYPES = {1: "int", 2: "bool", 3: "menu", 4: "button", 5: "int64", 6: "class", 7: "string", 8: "bitmask",
          9: "intmenu"}
 FLAGS = {0x1: "disabled", 0x4: "read-only", 0x10: "inactive", 0x40: "write-only", 0x80: "volatile"}
+REFUSED = {errno.EINVAL: "that value or mode is not supported",
+           errno.EACCES: "the control is inactive in the current mode, e.g. exposure time while exposure is automatic",
+           errno.ERANGE: "out of range"}
 
 
-def find_device() -> str:
-    """The first video node of a UVC camera (index 0 is the picture, index 1 its metadata)."""
+def find_device(name: str | None = None) -> str:
+    """The picture node (index 0; index 1 is metadata) of the first UVC camera whose name contains `name`.
+    Node numbers can change after a reboot or re-plug, so pick cameras by name when more than one is connected."""
+    found = []
     for node in sorted(Path("/sys/class/video4linux").glob("video*"), key=lambda p: int(p.name[5:])):
         driver = (node / "device" / "driver").resolve().name
         if driver == "uvcvideo" and (node / "index").read_text().strip() == "0":
-            return f"/dev/{node.name}"
+            cam = (node / "name").read_text().strip()
+            if name is None or name.lower() in cam.lower():
+                return f"/dev/{node.name}"
+            found.append(cam)
+    if found:
+        sys.exit(f"no USB camera named {name!r}; connected: {', '.join(found)}")
     sys.exit("no USB camera found: is the camera's USB cable connected to the Pi?")
 
 
@@ -89,11 +101,12 @@ def find(ctrls, ref: str):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--device", help="video node (default: the first USB camera)")
+    ap.add_argument("--camera", help="pick the USB camera whose name contains this, e.g. 'unite'")
+    ap.add_argument("--device", help="video node, e.g. /dev/video0 (default: the first USB camera)")
     ap.add_argument("action", nargs="?", choices=("list", "get", "set"), default="list")
     ap.add_argument("items", nargs="*", help="control names for get, NAME=VALUE for set")
     args = ap.parse_args()
-    dev = args.device or find_device()
+    dev = args.device or find_device(args.camera)
     fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)
     try:
         ctrls = controls(fd)
@@ -116,12 +129,20 @@ def main():
                 c = find(ctrls, ref)
                 print(f"{key(c['name'])} = {get(fd, c['id'])}")
         else:
+            refused = 0
             for item in args.items:
                 ref, _, value = item.partition("=")
                 c = find(ctrls, ref)
                 old = get(fd, c["id"])
-                set_(fd, c["id"], int(value))
+                try:
+                    set_(fd, c["id"], int(value))
+                except OSError as e:
+                    refused += 1
+                    print(f"{key(c['name'])}: the camera refused {value} ({e.strerror}: {REFUSED.get(e.errno, '')})")
+                    continue
                 print(f"{key(c['name'])}: {old} -> {get(fd, c['id'])}")
+            if refused:
+                sys.exit(1)
     finally:
         os.close(fd)
 
