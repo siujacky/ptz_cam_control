@@ -19,7 +19,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 STEADY_S = 5 * 60  # long enough to rule out a passing break in the clouds
-MAX_WAIT_S = 48 * 3600
+MAX_WAIT_S = 7 * 24 * 3600  # long enough to wait for a camera to be moved so the two pictures match
+PREFLIGHT_EVERY_S = 10 * 60  # while they do not, look again this often (the app keeps running meanwhile)
 ATTEMPTS = 3  # a failed calibration (the PTZ dropped off the network, a cloud mid-sweep) is tried again...
 RETRY_GAP_S = 30 * 60  # ...after this, at the next clear moment
 # Local hours (Pi clock) to consider at all. The picture checks below are what matter: this window faces the
@@ -65,6 +66,29 @@ def status():
         return json.load(r)
 
 
+def preflight() -> bool:
+    """Whether the PTZ's live picture is found in the eye's (the calibration's first step), checked on the running
+    app's own pictures, so the app is only stopped when the calibration can work."""
+    sys.path.insert(0, str(ROOT))
+    import cv2
+    import numpy as np
+    from ptzcam.syncal import match_views
+    try:
+        pics = []
+        for cam in ("ptz", "eye"):
+            with urllib.request.urlopen(f"http://127.0.0.1:8080/api/frame.jpg?camera={cam}&overlay=0&width=1920",
+                                        timeout=10) as r:
+                pics.append(cv2.imdecode(np.frombuffer(r.read(), np.uint8), cv2.IMREAD_COLOR))
+        return match_views(*pics) is not None
+    except Exception as e:
+        print(f"preflight failed: {e}", flush=True)
+        return False
+
+
+NO_MATCH = ("the PTZ's view is not found in the wide camera's picture: the wide camera must see the same street "
+            "clearly (not through an insect screen, and not mostly sky)")
+
+
 def wait_until_clear(start):
     """Until both pictures have been clear for STEADY_S inside HOURS. Returns the time they became clear, or None
     when MAX_WAIT_S (from `start`) ran out."""
@@ -102,12 +126,23 @@ def calibrate() -> int:
 def main():
     global LAST_ERROR
     start = time.time()
-    for attempt in range(1, ATTEMPTS + 1):
+    attempt = 0
+    while attempt < ATTEMPTS:
         since = wait_until_clear(start)
         if since is None:
-            report("failed", error=f"the pictures were never clear for {STEADY_S // 60} minutes in "
-                                   f"{MAX_WAIT_S // 3600} hours")
-            sys.exit("never clear for long enough: nothing done")
+            report("failed", error=LAST_ERROR or f"the pictures were never clear for {STEADY_S // 60} minutes in "
+                                                 f"{MAX_WAIT_S // 3600} hours")
+            sys.exit("never clear (or never matching) for long enough: nothing done")
+        if not preflight():  # not an attempt: the app keeps running, and it looks again later
+            LAST_ERROR = NO_MATCH
+            print(f"preflight: no match ({time.strftime('%H:%M')}); looking again in {PREFLIGHT_EVERY_S // 60} min",
+                  flush=True)
+            until = time.time() + PREFLIGHT_EVERY_S
+            while time.time() < until:
+                report("waiting", clear_for=0, error=LAST_ERROR)
+                time.sleep(POLL_S)
+            continue
+        attempt += 1
         print(f"clear since {time.strftime('%H:%M', time.localtime(since))}: syncing the cameras "
               f"(attempt {attempt} of {ATTEMPTS})", flush=True)
         code = calibrate()
