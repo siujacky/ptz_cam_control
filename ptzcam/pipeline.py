@@ -13,7 +13,10 @@ camera, the one the live view, photos and default clips come from, while the PTZ
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
+import math
+import os
 import threading
 import time
 from pathlib import Path
@@ -23,11 +26,11 @@ import cv2
 from .camera import FrameSource
 from .detector import HailoDetector
 from .draw import draw_overlay, offline_frame
-from .events import EventManager
+from .events import EventManager, point_in_polygon
 from .failover import Health, MainSelector
 from .lowlight import AutoLevels, LightMeter, NightView
 from .nightclip import NightClipper
-from .ptz import EYE_ID_BASE, AutoTracker, PTZController
+from .ptz import EYE_ID_BASE, RIDER, AutoTracker, PTZController
 from .recorder import ClipJob, Recorder
 from .sync import SyncMap
 from .tracker import TRACK_THRESH, Tracker
@@ -37,9 +40,16 @@ DETECTOR_RETRY_S = 30.0
 OVERLAY_HOLD_S = 0.5      # keep drawing a box this long after its last detection (avoids flicker)
 WHITE_TAU_S = 10.0        # the white share that failover uses is smoothed over about this long
 SELECT_EVERY_S = 1.0
+STARTUP_GRACE_S = 15.0    # a camera that has not sent its first picture yet is starting, not offline
 SYNC_CHECK_S = 10.0       # look for a new data/sync.json this often
-UVC_CHECK_S = 30.0        # put a camera's anti-flicker back this often, if it was reset
+UVC_CHECK_S = 30.0        # put a camera's anti-flicker (and the eye's crop) back this often, if it was reset
 CAMERAS = ("ptz", "eye")
+# Matching one object across the two cameras, in the eye's picture (fractions of its frame), through the sync map:
+LINK_RADIUS = 0.04        # a main-camera track this close to one the other camera counted joins that event
+HANDOVER_RADIUS = 0.06    # when counting moves to the other camera, a track this close to a counted one is counted
+HANDOVER_RECENT_S = 3.0   # counted tracks the old counter saw this long before it stopped working are still in view
+COUNTED_MEMORY_S = 30.0   # each camera's counted tracks are remembered this long after it last saw them
+BAD_LEAD_S = 10.0         # a whiting-out PTZ may have stopped detecting this long before its picture was flagged
 
 
 class LiveView:
@@ -190,6 +200,12 @@ class Pipeline:
         self._sync_t = self._uvc_t = self._select_t = 0.0
         self._eye_zone_key = None
         self._eye_zone = []
+        self._uvc_refused = set()
+        self._sync_pending = None  # tools/sync_when_clear.py's progress, for the status
+        self._counted = {c: {} for c in CAMERAS}  # role -> track id -> _Seen: what each camera counted, lately
+        self._last_det = {}  # role -> when it last detected anything (a whiting-out picture stops detecting first)
+        self._counted_lock = threading.Lock()
+        self._started_at = 0.0
         self._lock = threading.Lock()
         self._first_start = True
 
@@ -247,6 +263,7 @@ class Pipeline:
                              anti_flicker=eye["anti_flicker"], name="eye")
             units["eye"] = CameraUnit("eye", eye["name"], cap, cap.ring, tracker("eye"), self._views["eye"])
         self.units = units
+        self._started_at = time.time()
         self.autotracker.reset_target()  # old target ids mean nothing to the new trackers
         self.events = EventManager(self.cfg, self.storage, ptz_rec, self.media_dir, self.bus,
                                    night_clipper=self.night_clipper,
@@ -273,7 +290,11 @@ class Pipeline:
         units["ptz"].source.start()
         if "eye" in units:
             units["eye"].source.start(recover_eye)  # its ring first, then the capture
-        self._load_sync(force=True)
+        try:
+            self._load_sync(force=True)
+        except Exception:  # a broken sync.json must never keep the cameras from starting
+            self.log.exception("could not load the sync map; carrying on without it")
+            self.sync = self.autotracker.sync = None
         for unit in units.values():
             unit.stop = threading.Event()  # one Event per loop, so a late old loop can never resume
             unit.thread = threading.Thread(target=self._loop, args=(unit, unit.stop), name=f"pipeline-{unit.role}",
@@ -332,7 +353,11 @@ class Pipeline:
         while not stop.is_set():
             item = source.wait_frame(last_id, timeout=1.0)
             if item is None:
-                self._housekeeping()  # keep failover deciding while a camera is offline
+                try:
+                    self._housekeeping()  # keep failover deciding while a camera is offline
+                except Exception:  # never let it end this camera's thread: nothing would restart it
+                    self.log.exception("housekeeping failed (%s camera)", role)
+                    time.sleep(0.2)
                 continue
             fid, ts, frame = item
             last_id = fid
@@ -363,6 +388,8 @@ class Pipeline:
                         view.levels.reset()
                     src = corrected if corrected is not None and cfg["brightness"]["detect"] else frame
                     dets = det.detect(src, enhanced if ll["detect"] else None) if det is not None else []
+                if dets:
+                    self._last_det[role] = ts
                 dt = min(max(ts - last_t, 0.0), 1.0) if last_t is not None else 0.0
                 view.white += (view.levels.white - view.white) * min(1.0, dt / WHITE_TAU_S)
                 if shown is not None:
@@ -398,16 +425,29 @@ class Pipeline:
                     counting = self.counting == "ptz" and not frozen and (
                         not zone or not cfg["ptz"]["enabled"] or self.ptz.at_home)
                 else:
-                    zone = self._zone_for_eye(cfg)
                     counting = self.counting == "eye"
-                usable = not view.levels.blinded or view.night
+                    # Where something can be counted, in the eye's picture: its own zone when it counts, else the
+                    # PTZ's Home view and zone mapped onto it. The eye never moves, so entries are marked whether
+                    # or not it counts now (eye-follow picks only what can become an event).
+                    zone = self._zone_for_eye(cfg) if counting else self._ptz_zone_in_eye(cfg)
+                    if zone:
+                        for t in tracks:
+                            if t.confirmed and t.last_ts == ts and not t.in_zone and \
+                                    point_in_polygon((t.box[0] + t.box[2]) / 2, t.box[3], zone):
+                                t.in_zone = True
+                    self.autotracker.eye_zone = zone
+                    self.autotracker.eye_counted_only = self.counting != "eye"
+                usable = not view.levels.blinded or view.night  # it can see (aim corrections use this)
+                photo_ok = usable
                 if role == "ptz" and "eye" in self.units and self.selector.main == "eye" \
-                        and self.selector.reason == "PTZ picture washed out":
-                    usable = False  # no photo from a washed-out picture
-                events.process(ts, shown, tracks, removed, counting, zone=zone, usable=usable, camera=role)
-                if role == "ptz" and "eye" in self.units and (
-                        self.selector.main == "eye" or not self.ptz.at_home or frozen):
-                    events.wide_needed()
+                        and self.selector.ptz_unfit:
+                    photo_ok = False  # the wide camera took over from this picture: no photos from it until clear
+                if role != self.counting and self.counting in self.units and (main or role == "eye"):
+                    # The main camera's pictures become photos; and while the PTZ counts, the eye knows whom it
+                    # counted (eye-follow only leaves Home for them).
+                    self._link_to_counter(role, tracks, ts, cfg)
+                events.process(ts, shown, tracks, removed, counting, zone=zone, usable=photo_ok, camera=role)
+                self._remember_counted(role, tracks, ts)
                 if role == "ptz":
                     self.autotracker.ptz_usable = usable
                     self.autotracker.update(tracks, ts)
@@ -460,64 +500,234 @@ class Pipeline:
         eye = units.get("eye")
         if eye is None or not eye.online:
             self.autotracker.eye_active = False  # only the eye's own frames would clear it otherwise
-        if self.selector.tick(now, cfg["failover"], units["ptz"].health(), eye.health() if eye else None):
+        # Right after a start the cameras take a moment to send their first picture: that is not an outage (it would
+        # hand the view, and counting, to whichever camera was quicker, for return_after).
+        starting = now - self._started_at < STARTUP_GRACE_S and not all(u.online for u in units.values())
+        if not starting and self.selector.tick(now, cfg["failover"], units["ptz"].health(),
+                                               eye.health() if eye else None):
             self.log.info("main camera: %s (%s)", self.selector.main, self.selector.reason)
-            self.bus.publish("main", {"camera": self.selector.main, "reason": self.selector.reason})
+            self.bus.publish("main", {"camera": self.selector.main, "reason": self.selector.reason,
+                                      "since": self.selector.since})
         if self.events is not None:
             self.events.main = self.selector.main if self.selector.main in units else "ptz"
+            # Another camera counts and, without the sync map, its tracks cannot be matched to the main camera's:
+            # the main camera's own picture of the moment is the photo.
+            self.events.photo_from_main = eye is not None and self.counting != self.events.main and self.sync is None
         self._update_counting(cfg)
+        self._mark_wide_needed(cfg)
         if now - self._sync_t >= SYNC_CHECK_S:
             self._sync_t = now
             self._load_sync()
+            self._read_sync_pending()
+        self._eye_controls(cfg, check=now - self._uvc_t >= UVC_CHECK_S)
         if now - self._uvc_t >= UVC_CHECK_S:
             self._uvc_t = now
             self._keep_anti_flicker(cfg)
 
+    def _mark_wide_needed(self, cfg):
+        """eye.clips "auto" keeps an event's wide clip when the PTZ clip does not show the whole scene: the eye was
+        main, the PTZ was offline, or it left its Home view (moving or following) during the event. Decided here,
+        whichever camera sends frames, so an offline PTZ still counts."""
+        events, ptz_unit = self.events, self.units.get("ptz")
+        a = events.active if events is not None else None
+        if a is None or "eye" not in self.units or ptz_unit is None:
+            return
+        ptz = self.ptz
+        away = cfg["ptz"]["enabled"] and (not ptz.at_home or ptz.quiet_since() >= a.start)
+        if self.selector.main != "ptz" or not ptz_unit.online or away:
+            events.wide_needed()
+
     def _update_counting(self, cfg):
-        """The eye counts when it can (its view never moves); otherwise the PTZ counts on its Home view, as with
-        one camera. On a change, what the new counter already sees is taken as counted, so nobody is counted twice."""
+        """The eye counts when it can (its view never moves) and knows where: its own zone, or the PTZ's Home view
+        mapped through the sync map. Otherwise the PTZ counts on its Home view, as with one camera. While the PTZ
+        is washed out or offline the eye counts its whole view rather than nobody counting."""
         eye = self.units.get("eye")
         eye_ok = eye is not None and eye.online and not eye.health().blinded
-        if eye_ok and cfg["eye"]["count"] and (cfg["eye"]["zone"] or self.sync is not None):
+        if eye_ok and cfg["eye"]["count"] and self._zone_for_eye(cfg):
             want = "eye"
         elif eye_ok and cfg["eye"]["count"] and self.selector.main == "eye":
-            want = "eye"  # the PTZ is washed out or offline: count on the eye's view rather than not at all
+            want = "eye"
         else:
             want = "ptz"
         if want == self.counting:
             return
-        self.log.info("counting on the %s camera", "wide" if want == "eye" else "PTZ")
-        for t in list(getattr(self.units[want].tracker, "tracks", ())):
-            if not t.counted:
-                t.counted = True
+        n = self._hand_over(self.counting, want, cfg)
+        self.log.info("counting on the %s camera%s", "wide" if want == "eye" else "PTZ",
+                      f" ({n} already counted in view)" if n else "")
         self.counting = want
+
+    def _hand_over(self, old: str, new: str, cfg) -> int:
+        """Counting moves from camera `old` to `new`. What the new counter sees now that the old one already counted
+        must not count again, but everything else must still count (a washed-out PTZ counted nobody for a while).
+        Through the sync map, with the PTZ still, tracks are matched by position; otherwise, per kind of object, as
+        many as the old counter has counted in view (the longest-seen first). Returns how many were matched."""
+        nu, ou = self.units.get(new), self.units.get(old)
+        if nu is None or ou is None:
+            return 0
+        now = time.time()
+        # Recent as of when the old counter last worked: its last picture if it went offline (seen as offline only
+        # 5 s later), or when the PTZ picture went bad if it washed out (its tracks fade out with the detections).
+        ref = now
+        age = ou.source.last_frame_age
+        if not ou.online and age is not None:
+            ref = now - age
+        if old == "ptz" and self.selector.bad_since is not None:
+            # Its detections fade out before the white/blinded flags trip: from when it last detected anything, but
+            # no further back than BAD_LEAD_S before the flags.
+            last = self._last_det.get(old, ref)
+            ref = min(ref, self.selector.bad_since, max(last, self.selector.bad_since - BAD_LEAD_S))
+        with self._counted_lock:
+            done = [s for s in self._counted[old].values() if s.last_ts >= ref - HANDOVER_RECENT_S]
+        fresh = [t for t in list(nu.tracker.tracks) if t.confirmed and not t.counted and now - t.last_ts < 1.0]
+        if not fresh or not done:
+            return 0
+        # Positions that old say little about where they are now: then match by number.
+        view = self._ptz_in_eye(cfg) if now - ref <= HANDOVER_RECENT_S else None
+        pairs = []
+        if view is not None:
+            cand = []
+            for n in fresh:
+                for o in done:
+                    p, e = (o, n) if old == "ptz" else (n, o)
+                    d = self._eye_dist(view, p, e)
+                    if d is not None and d < HANDOVER_RADIUS:
+                        cand.append((d, n, o))
+            used = set()
+            for _, n, o in sorted(cand, key=lambda c: c[0]):
+                if id(n) not in used and id(o) not in used:
+                    used.update((id(n), id(o)))
+                    pairs.append((n, o))
+        else:  # only among what the new counter could count (a parked car must not take a passer-by's count)
+            left = {}
+            for o in sorted(done, key=lambda t: t.first_ts):
+                left.setdefault(o.category, []).append(o)
+            for n in sorted((t for t in fresh if self._could_count(t, new, cfg)), key=lambda t: t.first_ts):
+                if left.get(n.category):
+                    pairs.append((n, left[n.category].pop(0)))
+        for n, o in pairs:
+            n.counted, n.event_id = True, o.event_id
+        return len(pairs)
+
+    def _remember_counted(self, role, tracks, ts):
+        """Keep what this camera counted for a while after its tracker lets go (a hand-over comes seconds later)."""
+        with self._counted_lock:
+            mem = self._counted[role]
+            for t in tracks:
+                if t.counted and t.last_ts == ts:
+                    mem[t.id] = _Seen(t)
+            for k in [k for k, s in mem.items() if ts - s.last_ts > COUNTED_MEMORY_S]:
+                del mem[k]
+
+    def _could_count(self, t, role, cfg) -> bool:
+        """Whether camera `role` could count track `t`: moving, of an enabled kind, and inside its zone."""
+        c = cfg["detect"]["categories"].get(t.category)
+        if not c or not c["enabled"] or t.max_score < c["min_score"] or not t.moving:
+            return False
+        zone = self._zone_for_eye(cfg) if role == "eye" else cfg["detect"]["zone"]
+        return not zone or t.in_zone or point_in_polygon((t.box[0] + t.box[2]) / 2, t.box[3], zone)
+
+    def _link_to_counter(self, role, tracks, ts, cfg):
+        """Photos come from the main camera. While the other camera counts, the main camera's tracks of objects it
+        counted into the open event join that event, matched by position through the sync map, so their pictures can
+        become the photo. They are taken as counted: never counted again by this camera."""
+        events, other = self.events, self.units.get(self.counting)
+        a = events.active if events is not None else None
+        if a is None or other is None or other.role == role:
+            return
+        theirs = [t for t in list(other.tracker.tracks) if t.event_id == a.id and ts - t.last_ts < 1.0]
+        if not theirs:
+            return
+        view = self._ptz_in_eye(cfg)
+        if view is None:
+            return
+        for p in tracks:
+            if not p.confirmed or p.last_ts != ts or p.event_id is not None:
+                continue
+            best = None
+            for o in theirs:
+                d = self._eye_dist(view, p, o) if role == "ptz" else self._eye_dist(view, o, p)
+                if d is not None and d < LINK_RADIUS and (best is None or d < best):
+                    best = d
+            if best is not None:
+                p.event_id, p.counted = a.id, True
+
+    def _eye_dist(self, view, p, e):
+        """Distance in the eye's picture between PTZ track `p` and eye track `e`, at the moment p's picture was
+        taken (the PTZ picture lags more than the eye's), or None if they cannot be the same object."""
+        if not (p.category == e.category or (p.category in RIDER and e.category in RIDER)):
+            return None
+        cu, cv, fw, fh = view
+        ph = float(p.box[3] - p.box[1]) * fh
+        eh = float(e.box[3] - e.box[1])
+        if not 0.5 <= ph / max(eh, 1e-3) <= 2.0:
+            return None
+        at = self.autotracker
+        dt = (p.last_ts - at.PTZ_LAG_S) - (e.last_ts - at.EYE_LAT_S)
+        eu, ev = e.center[0] + float(e.vel[0]) * dt, e.center[1] + float(e.vel[1]) * dt
+        pu, pv = cu + (p.center[0] - 0.5) * fw, cv + (p.center[1] - 0.5) * fh
+        return float(((pu - eu) ** 2 + (pv - ev) ** 2) ** 0.5)
+
+    def _ptz_in_eye(self, cfg):
+        """Where the PTZ's picture is in the eye's, (u, v, width, height), while the PTZ is still; else None."""
+        sync, ptz = self.sync, self.ptz
+        if sync is None:
+            return None
+        if cfg["ptz"]["enabled"]:
+            if ptz.is_moving() or time.time() - ptz.quiet_since() < cfg["ptz"]["settle_seconds"]:
+                return None
+            pose, zp = ptz.pose_estimate(), ptz.zoom_pos
+            if pose is None or zp is None:
+                return None
+        else:  # the app never moves it: it shows its Home view
+            home = self._home_pose()
+            if home is None:
+                return None
+            pose, zp = home[:2], home[2]
+        cu, cv = sync.to_eye(*pose)
+        fld = sync.field(cu, cv, zp, cfg["ptz"]["zoom_curve"])
+        return (cu, cv, fld[0], fld[1]) if fld else None
+
+    def _home_pose(self):
+        """The PTZ's Home view (pan, tilt, zoom): as read at Home, else as the sync calibration found it."""
+        ptz = self.ptz
+        pan, tilt, zoom = ptz.home_pan, ptz.home_tilt, ptz.home_zoom
+        if pan is not None and tilt is not None and zoom is not None:
+            return pan, tilt, zoom
+        home = self.sync.meta.get("ptz_home") if self.sync is not None else None
+        if isinstance(home, (list, tuple)) and len(home) == 3 and \
+                all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in home):
+            return tuple(home)
+        return None
 
     def _zone_for_eye(self, cfg):
         """The eye's counting zone: its own, or else the PTZ's zone (or its whole Home view) mapped into the eye's
-        picture through the sync map, so the counted area matches the counts made before."""
-        if cfg["eye"]["zone"]:
-            return cfg["eye"]["zone"]
-        sync, ptz = self.sync, self.ptz
-        if sync is None or ptz.home_pan is None or ptz.home_zoom is None:
+        picture through the sync map, so the counted area matches the counts made before. [] if neither is known."""
+        return cfg["eye"]["zone"] or self._ptz_zone_in_eye(cfg)
+
+    def _ptz_zone_in_eye(self, cfg):
+        """The PTZ's counting zone, or its whole Home view, in the eye's picture; [] without a sync map or a Home."""
+        sync, home = self.sync, self._home_pose()
+        if sync is None or home is None:
             return []
-        key = (id(sync), ptz.home_pan, ptz.home_tilt, ptz.home_zoom, tuple(map(tuple, cfg["detect"]["zone"])))
+        curve = cfg["ptz"]["zoom_curve"]
+        key = (id(sync), home, tuple(map(tuple, cfg["detect"]["zone"])), tuple(map(tuple, curve)))
         if key != self._eye_zone_key:
-            u, v = sync.to_eye(ptz.home_pan, ptz.home_tilt)
-            fld = sync.field(u, v, ptz.home_zoom, cfg["ptz"]["zoom_curve"])
+            u, v = sync.to_eye(home[0], home[1])
+            fld = sync.field(u, v, home[2], curve)
             pts = cfg["detect"]["zone"] or [[0, 0], [1, 0], [1, 1], [0, 1]]
-            self._eye_zone = [] if fld is None else [
+            zone = [] if fld is None else [
                 [min(max(u + (x - 0.5) * fld[0], 0.0), 1.0), min(max(v + (y - 0.5) * fld[1], 0.0), 1.0)] for x, y in pts]
-            self._eye_zone_key = key
+            self._eye_zone, self._eye_zone_key = zone, key
         return self._eye_zone
 
     def _ptz_rect(self, cfg):
         sync, ptz = self.sync, self.ptz
         if sync is None or "eye" not in self.units:
             return None
-        pose = ptz.pose_estimate()
-        if pose is None or ptz.zoom_pos is None:
+        pose, zp = ptz.pose_estimate(), ptz.zoom_pos
+        if pose is None or zp is None:
             return None
-        return sync.ptz_view(pose[0], pose[1], ptz.zoom_pos, cfg["ptz"]["zoom_curve"])
+        return sync.ptz_view(pose[0], pose[1], zp, cfg["ptz"]["zoom_curve"])
 
     def _load_sync(self, force=False):
         """data/sync.json, measured by tools/calibrate_sync.py for this eye camera."""
@@ -540,48 +750,123 @@ class Pipeline:
             except Exception as e:
                 self.log.error("cannot read %s: %s", path, e)
                 m = None
-            if m is not None:
-                self._restore_eye_crop(m)
+        if "eye" in self.units:
+            try:
+                self._set_eye_crop(m)
+            except Exception:  # only the crop is lost, not the map
+                self.log.exception("could not set the eye camera's crop from sync.json")
         if (m is None) != (self.sync is None) or force:
             self.log.info("sync map %s", f"loaded ({len(m.samples)} positions)" if m is not None else "not available")
         self.sync = self.autotracker.sync = m
         self._eye_zone_key = None
 
-    def _restore_eye_crop(self, m):
-        """The map holds only for the eye's crop (digital pan/tilt/zoom) at calibration: put it back."""
-        eptz = m.meta.get("eye_eptz") or {}
-        if not eptz:
+    def _read_sync_pending(self):
+        """tools/sync_when_clear.py, waiting for a clear moment to sync the cameras, writes its progress to
+        data/sync_pending.json (and removes it once synced). Shown while it runs, and a failure for a day."""
+        path = self.cfg.resolve(self.cfg.data["storage"]["data_dir"]) / "sync_pending.json"
+        d = None
+        try:
+            d = json.loads(path.read_text())
+        except (OSError, ValueError):
+            pass
+        if not isinstance(d, dict) or d.get("state") not in ("waiting", "syncing", "failed"):
+            self._sync_pending = None
             return
+        age = time.time() - float(d.get("updated") or 0)
+        live = _pid_alive(d.get("pid")) and age < 600
+        if d["state"] == "failed" and age > 86400 or d["state"] != "failed" and not live:
+            self._sync_pending = None  # gone (stopped, rebooted) or long ago
+            return
+        self._sync_pending = {k: d.get(k) for k in ("state", "since", "clear_for", "need", "error", "updated")}
+
+    def _counting_note(self, cfg) -> str:
+        """Why the wide camera does not count now ("" when it does, or when there is none)."""
+        eye = self.units.get("eye")
+        if eye is None or self.counting == "eye":
+            return ""
+        if not cfg["eye"]["count"]:
+            return "counting on the wide camera is off"
+        if not eye.online:
+            return "the wide camera is offline"
+        if eye.health().blinded:
+            return "the wide camera is blinded"
+        if not cfg["eye"]["zone"] and self.sync is None:
+            return "the wide camera needs the camera sync, or a zone drawn on its picture"
+        if not self._zone_for_eye(cfg):
+            return "waiting to read where the PTZ's Home view is"
+        return ""
+
+    def _set_eye_crop(self, m):
+        """The map holds only for the eye's crop (digital pan/tilt/zoom) at calibration. The capture puts it back on
+        every connect (a re-plug resets it) and _eye_controls checks it, so the map always fits the picture."""
+        eptz = (m.meta.get("eye_eptz") if m is not None else None) or {}
+        if not isinstance(eptz, dict):
+            self.log.warning("sync.json has an unreadable eye crop (%r); ignoring it", eptz)
+            eptz = {}
+        crop = {}
+        if eptz:
+            for name, value in eptz.items():
+                if isinstance(name, str) and isinstance(value, (int, float)) and not isinstance(value, bool) \
+                        and math.isfinite(value):
+                    crop[name] = int(value)
+        if eptz and len(crop) != len(eptz):
+            self.log.warning("sync.json has an unreadable eye crop (%r); using what can be read", eptz)
+        src = self.units["eye"].source
+        src.crop = crop
+        if crop:
+            self._apply_uvc("eye camera", self.cfg.data["eye"]["device"], crop)
+
+    def _eye_controls(self, cfg, check: bool):
+        """The eye's anti-flicker follows the settings at once (no restart needed); with `check`, it and the crop are
+        also read back and put back if the camera reset them."""
+        eye = self.units.get("eye")
+        if eye is None:
+            return
+        src, want = eye.source, cfg["eye"]["anti_flicker"]
+        changed = src.anti_flicker != want
+        src.anti_flicker = want  # also what the capture sets on its next connect
+        if not (changed or check):
+            return
+        values = dict(getattr(src, "crop", None) or {})
+        if want is not None and want >= 0:
+            values["power_line_frequency"] = want
+        if values:  # by name: after a re-plug its old node number may belong to the other camera
+            self._apply_uvc("eye camera", cfg["eye"]["device"], values)
+
+    def _apply_uvc(self, what, device, values: dict):
         from . import uvc
         try:
-            dev = uvc.find_device(self.cfg.data["eye"]["device"])
-            for name, value in eptz.items():
-                old, new = uvc.write_control(dev, name, int(value))
-                if old != new:
-                    self.log.info("eye camera %s put back to %s (was %s)", name, new, old)
-        except (OSError, LookupError, KeyError, ValueError) as e:
-            self.log.warning("could not check the eye camera's crop: %s", e)
+            dev = uvc.find_device(device)
+            for name, value in values.items():
+                try:
+                    if uvc.read_control(dev, name) != value:
+                        old, new = uvc.write_control(dev, name, value)
+                        self.log.info("%s %s put back to %s (was %s)", what, name, new, old)
+                    self._uvc_refused.discard((what, name, value))
+                except (OSError, LookupError, KeyError, ValueError) as e:
+                    if (what, name, value) not in self._uvc_refused:  # once, not every check
+                        self._uvc_refused.add((what, name, value))
+                        self.log.warning("%s %s not set to %s: %s", what, name, value, e)
+        except Exception as e:  # unplugged, or anything else: try again next time
+            self.log.debug("%s controls not checked: %s", what, e)
 
     def _keep_anti_flicker(self, cfg):
         """A camera restart resets its anti-flicker; put back the configured one on the PTZ camera's USB link
-        (the eye's capture applies its own each time it connects)."""
+        (the eye's is handled by _eye_controls and by its capture on every connect)."""
         name, want = cfg["camera"]["usb_device"], cfg["camera"]["anti_flicker"]
         if not name or want < 0:
             return
-        from . import uvc
-        try:
-            dev = uvc.find_device(name)
-            if uvc.read_control(dev, "power_line_frequency") != want:
-                uvc.write_control(dev, "power_line_frequency", want)
-                self.log.info("%s anti-flicker put back to %s", name, ("off", "50 Hz", "60 Hz")[want])
-        except (OSError, LookupError, KeyError) as e:
-            self.log.debug("anti-flicker check for %s skipped: %s", name, e)
+        self._apply_uvc(name, name, {"power_line_frequency": want})
 
     # ---- status ----
+    def _name(self, role: str) -> str:
+        cfg = self.cfg.data
+        return cfg["eye"]["name"] if role == "eye" else cfg["camera"]["name"]  # live: a rename shows at once
+
     def _camera_status(self, unit: CameraUnit) -> dict:
         v, src, rec = unit.view, unit.source, unit.recorder
         return {
-            "name": unit.name, "online": unit.online, "fps": round(src.fps, 1),
+            "name": self._name(unit.role), "online": unit.online, "fps": round(src.fps, 1),
             "last_frame_age": src.last_frame_age, "white": round(v.white * 100, 1),
             "blinded": v.levels.blinded and not v.night, "night": v.night,
             "luma": round(v.lightmeter.luma, 1) if v.lightmeter.luma is not None else None,
@@ -601,7 +886,7 @@ class Pipeline:
         sync = self.sync
         return {
             "camera": {  # what the live view shows: the main camera
-                "name": mu.name if mu else cfg["camera"]["name"], "online": bool(mu and mu.online),
+                "name": self._name(mu.role) if mu else cfg["camera"]["name"], "online": bool(mu and mu.online),
                 "fps": round(mu.source.fps, 1) if mu else 0.0,
                 "width": cfg["detect"]["width"], "height": cfg["detect"]["height"],
                 "last_frame_age": mu.source.last_frame_age if mu else None,
@@ -610,9 +895,11 @@ class Pipeline:
             "main": {"camera": main, "reason": self.selector.reason, "since": self.selector.since,
                      "mode": cfg["failover"]["mode"]},
             "counting": self.counting,
-            "counting_area": ("wide zone" if cfg["eye"]["zone"] else "PTZ Home view" if self._eye_zone else
-                              "whole wide view") if self.counting == "eye" else "PTZ Home view",
+            "counting_note": self._counting_note(cfg),
+            "counting_area": ("wide zone" if cfg["eye"]["zone"] else "PTZ Home view" if self._ptz_zone_in_eye(cfg)
+                              else "whole wide view") if self.counting == "eye" else "PTZ Home view",
             "sync": {"calibrated": sync is not None, "created": sync.created if sync else None,
+                     "scheduled": self._sync_pending,
                      "positions": len(sync.samples) if sync else 0,
                      "residuals": (sync.meta.get("residuals") or {}) if sync else {}},
             "detector": {
@@ -645,3 +932,25 @@ class Pipeline:
                 "detect": cfg["lowlight"]["detect"], "save_clips": cfg["lowlight"]["save_clips"],
             },
         }
+
+
+def _pid_alive(pid) -> bool:
+    """Whether process `pid` exists (it may belong to another user, such as root)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class _Seen:
+    """What a camera's counted track looked like when last seen (for a later hand-over)."""
+    __slots__ = ("id", "category", "box", "center", "vel", "last_ts", "first_ts", "event_id")
+
+    def __init__(self, t):
+        self.id, self.category, self.box, self.center = t.id, t.category, t.box.copy(), t.center
+        self.vel, self.last_ts, self.first_ts, self.event_id = t.vel.copy(), t.last_ts, t.first_ts, t.event_id

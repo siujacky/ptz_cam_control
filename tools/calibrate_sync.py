@@ -64,11 +64,13 @@ class Ptz:
             raise RuntimeError(f"the zoom did not reach {pos} (read {p[2]})")
 
     def home(self):
+        """Recall Home; returns its (pan, tilt, zoom) once there."""
         if self.home_preset:
             self.v.send(b"\x01\x04\x3f\x02" + bytes([self.home_preset]))
-        else:
+        else:  # as the app's Home: pan/tilt home and fully wide (the lens sweep ends fully zoomed in)
             self.v.send(b"\x01\x06\x04")
-        self._still()
+            self.v.send(b"\x01\x04\x47" + _nibbles(0))
+        return self._still()
 
 
 def main():
@@ -137,7 +139,7 @@ def main():
             ptz.home()
             time.sleep(2.0)
             curve, rate = calibrate_lens(visca, lambda: source.latest()[2])
-        ptz.home()
+        home = ptz.home()  # the app maps the PTZ's Home view with it until it has read Home itself
     finally:
         try:
             ptz.home()
@@ -147,7 +149,8 @@ def main():
             source.stop()
 
     m.eye_size = (eye_cfg["width"], eye_cfg["height"])
-    m.meta = {"eye_device": eye_cfg["device"], "eye_eptz": eptz, "grid": [gx, gy], "residuals": m.residuals()}
+    m.meta = {"eye_device": eye_cfg["device"], "eye_eptz": eptz, "grid": [gx, gy], "ptz_home": list(home),
+              "residuals": m.residuals()}
     r = m.meta["residuals"]
     print(f"{len(m.samples)} positions; tilt reached {m.tilt_limits[0]:.0f}..{m.tilt_limits[1]:.0f}")
     if r:

@@ -45,11 +45,13 @@ CREATE INDEX IF NOT EXISTS idx_tracks_day ON tracks(day, category);
 
 _EVENT_FIELDS = {"start_ts", "trigger_ts", "end_ts", "last_seen_ts", "top_category", "categories", "labels",
                  "max_score", "snapshot", "thumb", "clip", "clip_status", "night", "clip_night", "clip_night_status",
-                 "clip_wide", "clip_wide_status", "main_camera", "clip_lead", "clip_wide_lead"}
+                 "clip_wide", "clip_wide_status", "main_camera", "clip_lead", "clip_wide_lead", "clip_wide_keep"}
 # Columns added after the first release, created on older databases at open.
 _EVENT_MIGRATIONS = (("night", "INTEGER NOT NULL DEFAULT 0"), ("clip_night", "TEXT"), ("clip_night_status", "TEXT"),
                      ("clip_wide", "TEXT"), ("clip_wide_status", "TEXT"), ("main_camera", "TEXT"),
-                     ("clip_lead", "REAL"), ("clip_wide_lead", "REAL"))
+                     ("clip_lead", "REAL"), ("clip_wide_lead", "REAL"),
+                     # 1 once the PTZ left its Home view (or was not main) during the event: its wide clip is kept
+                     ("clip_wide_keep", "INTEGER NOT NULL DEFAULT 0"))
 _TRACK_MIGRATIONS = (("camera", "TEXT"),)  # which camera counted it: "ptz" or "eye"
 _TRACK_FIELDS = {"last_ts", "max_score", "direction", "label"}
 

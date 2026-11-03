@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from ptzcam.events import EventManager, point_in_polygon
@@ -133,9 +134,6 @@ def event_categories(row):
     return json.loads(row["categories"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class WideClipTests(unittest.TestCase):
     """With an eye camera every event also asks for clip_wide.mp4; eye.clips "auto" keeps it only when the PTZ's
@@ -165,20 +163,67 @@ class WideClipTests(unittest.TestCase):
         out.write_bytes(b"x" * 20000)  # the clip builder made it
         return eid, out, done
 
+    def ptz_clip(self, ok=True):
+        eid, _, _, out, done = self.rec.jobs[-1]
+        done(eid, ok)
+
     def test_auto_drops_the_wide_clip_when_the_ptz_stayed_home(self):
-        eid, out, done = self.count_one()
-        done(eid, True)
-        row = self.storage.get_event(eid)
-        self.assertIsNone(row["clip_wide_status"])
-        self.assertFalse(out.exists())
-        self.assertEqual(self.storage.get_event(eid)["main_camera"], "ptz")
+        for ptz_first in (True, False):  # the two rings finish in either order
+            with self.subTest(ptz_first=ptz_first):
+                self.t += 60
+                eid, out, done = self.count_one()
+                if ptz_first:
+                    self.ptz_clip()
+                done(eid, True)
+                if not ptz_first:  # kept until the PTZ clip is known to show it all
+                    self.assertEqual(self.storage.get_event(eid)["clip_wide_status"], "ready")
+                    self.assertTrue(out.exists())
+                    self.ptz_clip()
+                row = self.storage.get_event(eid)
+                self.assertIsNone(row["clip_wide_status"])
+                self.assertFalse(out.exists())
+                self.assertEqual(row["clip_status"], "ready")
+                self.assertEqual(row["main_camera"], "ptz")
         self.assertEqual(self.storage._all("SELECT camera FROM tracks")[0]["camera"], "eye")
 
     def test_auto_keeps_it_when_the_ptz_followed_or_the_eye_was_main(self):
         eid, out, done = self.count_one()
         self.events.wide_needed()  # the PTZ left Home during the event
+        self.ptz_clip()
         done(eid, True)
         self.assertEqual(self.storage.get_event(eid)["clip_wide_status"], "ready")
+        self.assertTrue(out.exists())
+        self.t += 60
+        self.events.main = "eye"  # the PTZ washed out or offline when the event began
+        eid, out, done = self.count_one()
+        self.ptz_clip()
+        done(eid, True)
+        self.assertEqual(self.storage.get_event(eid)["clip_wide_status"], "ready")
+
+    def test_auto_keeps_it_when_the_ptz_clip_failed(self):
+        for ptz_first in (True, False):
+            with self.subTest(ptz_first=ptz_first):
+                self.t += 60
+                eid, out, done = self.count_one()
+                if ptz_first:
+                    self.ptz_clip(ok=False)
+                done(eid, True)
+                if not ptz_first:
+                    self.ptz_clip(ok=False)
+                row = self.storage.get_event(eid)
+                self.assertEqual((row["clip_status"], row["clip_wide_status"]), ("failed", "ready"))
+                self.assertTrue(out.exists())
+
+    def test_the_decision_survives_a_restart(self):
+        eid, out, done = self.count_one()
+        self.events.wide_needed()
+        self.ptz_clip()
+        # The service died before the wide clip was cut; a new run recovers the job with a new EventManager.
+        fresh = EventManager(self.cfg, self.storage, FakeRecorder(), self.media, FakeBus(), wide_recorder=FakeRecorder())
+        fresh._wide_clip_done(eid, True, 0.4)
+        row = self.storage.get_event(eid)
+        self.assertEqual(row["clip_wide_status"], "ready")
+        self.assertAlmostEqual(row["clip_wide_lead"], 0.4)
         self.assertTrue(out.exists())
 
     def test_always_and_never(self):
@@ -194,3 +239,50 @@ class WideClipTests(unittest.TestCase):
             tracks, removed = self.tracker.update([det(0.9 - 0.012 * i, 0.3)], self.t)
             self.events.process(self.t, FRAME, tracks, removed, True, camera="eye")
         self.assertEqual(len(self.wide.jobs), jobs)  # never asked for
+
+
+class PhotoSourceTests(unittest.TestCase):
+    """Photos come from the main camera where its picture surely shows the object: the wide view holds the PTZ's."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.storage = Storage(root / "t.db")
+        self.media = root / "media"
+        self.events = EventManager(FakeConfig(), self.storage, FakeRecorder(), self.media, FakeBus(),
+                                   wide_recorder=FakeRecorder())
+        self.trackers = {"ptz": Tracker(16 / 9), "eye": Tracker(16 / 9)}
+        self.t = 1_800_000_000.0
+
+    def tearDown(self):
+        self.storage.close()
+        self.tmp.cleanup()
+
+    def run_both(self, counter, usable=True, frames=30):
+        """The PTZ's picture is level 40, the eye's 110; `counter` counts a walker that both see."""
+        level = {"ptz": 40, "eye": 110}
+        for i in range(frames):
+            self.t += 1 / FPS
+            for cam in ("ptz", "eye"):
+                frame = np.full((720, 1280, 3), level[cam], np.uint8)
+                tracks, removed = self.trackers[cam].update([det(0.2 + 0.01 * i, 0.5)], self.t)
+                self.events.process(self.t, frame, tracks, removed, cam == counter,
+                                    usable=usable or cam != counter, camera=cam)
+        rows = self.storage._all("SELECT snapshot FROM events")
+        self.assertEqual(len(rows), 1)
+        return float(np.median(cv2.imread(str(self.media / rows[0]["snapshot"]))))
+
+    def test_the_ptz_counts_and_the_wide_camera_is_main_without_the_sync(self):
+        self.events.main, self.events.photo_from_main = "eye", True
+        self.assertAlmostEqual(self.run_both("ptz"), 110, delta=8)  # the wide picture: it shows the PTZ's view
+
+    def test_the_wide_camera_counts_and_the_ptz_is_main_without_the_sync(self):
+        self.events.main, self.events.photo_from_main = "ptz", True
+        self.assertAlmostEqual(self.run_both("eye"), 110, delta=8)  # its own picture of it: the PTZ may not show it
+
+    def test_a_washed_out_ptz_counting_gives_way_to_the_wide_picture(self):
+        self.events.main, self.events.photo_from_main = "eye", False
+        self.assertAlmostEqual(self.run_both("ptz", usable=False), 110, delta=8)
+
+if __name__ == "__main__":
+    unittest.main()

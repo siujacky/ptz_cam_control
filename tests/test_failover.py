@@ -58,7 +58,8 @@ class MainSelectorTest(unittest.TestCase):
         self.assertEqual(run(s, 10, WHITE), [])  # clear spell broken: the timer restarts
         changes = run(s, 125, CLEAR)
         self.assertEqual([c[1] for c in changes], ["ptz"])
-        self.assertEqual(s.reason, "PTZ picture clear again")
+        self.assertEqual(s.history[-1][2], "PTZ picture clear again")
+        self.assertEqual(s.reason, "PTZ camera")
 
     def test_offline_cameras_switch_at_once_even_inside_the_dwell(self):
         s = MainSelector()
@@ -84,6 +85,61 @@ class MainSelectorTest(unittest.TestCase):
         s = MainSelector()
         run(s, 40, CLEAR)
         self.assertEqual(run(s, 60, BLIND, eye=Health(True, 0.97, blinded=True)), [])
+
+    def test_the_reason_follows_the_ptz_after_an_outage(self):
+        s = MainSelector()
+        run(s, 40, CLEAR)
+        run(s, 30, WHITE)
+        self.assertEqual((s.main, s.reason), ("eye", "PTZ picture washed out"))
+        run(s, 5, Health(False))
+        self.assertEqual(s.reason, "PTZ camera offline")
+        self.assertFalse(s.ptz_clear)
+        run(s, 5, WHITE)  # back, but still white: not "offline" any more, and no photos from it
+        self.assertEqual((s.main, s.reason), ("eye", "PTZ picture washed out"))
+        self.assertFalse(s.ptz_clear)
+        run(s, 5, Health(True, 0.35))
+        self.assertEqual(s.reason, "PTZ picture not clear yet")
+        run(s, 5, CLEAR)
+        self.assertEqual(s.reason, "PTZ picture clearing up")
+        self.assertTrue(s.ptz_clear)
+
+    def test_the_reason_clears_once_the_wide_camera_is_back(self):
+        s = MainSelector()
+        run(s, 40, CLEAR)
+        run(s, 3, CLEAR, eye=Health(False))
+        self.assertEqual(s.reason, "wide camera offline")
+        run(s, 3, CLEAR)
+        self.assertEqual((s.main, s.reason), ("ptz", "PTZ camera"))
+
+    def test_a_ptz_that_never_washed_out_stays_fit_for_photos(self):
+        s = MainSelector()
+        cfg = dict(CFG, mode="eye")  # the wide camera set as main; the PTZ a bit hazy (33 % white)
+        run(s, 60, Health(True, 0.33), cfg=cfg)
+        self.assertEqual(s.main, "eye")
+        self.assertFalse(s.ptz_unfit)
+
+    def test_after_a_washout_or_an_outage_the_ptz_is_unfit_until_clear(self):
+        s = MainSelector()
+        run(s, 40, CLEAR)
+        run(s, 30, WHITE)
+        self.assertTrue(s.ptz_unfit)
+        run(s, 5, Health(True, 0.35))  # better, not clear
+        self.assertTrue(s.ptz_unfit)
+        run(s, 3, CLEAR)
+        self.assertFalse(s.ptz_unfit)
+        run(s, 2, Health(False))
+        self.assertTrue(s.ptz_unfit)
+        run(s, 3, Health(True, 0.4))  # back, not clear yet
+        self.assertTrue(s.ptz_unfit)
+
+    def test_the_reason_during_the_minimum_hold(self):
+        s = MainSelector()
+        cfg = dict(CFG, mode="ptz")
+        run(s, 40, CLEAR, cfg=cfg)
+        run(s, 3, Health(False), cfg=cfg)  # a short RTSP drop: the wide camera at once
+        self.assertEqual(s.main, "eye")
+        run(s, 5, CLEAR, cfg=cfg)  # back, inside the minimum time on a camera
+        self.assertEqual((s.main, s.reason), ("eye", "switching to the PTZ camera shortly"))
 
     def test_forced_modes(self):
         s = MainSelector()

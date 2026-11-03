@@ -204,7 +204,7 @@ The user mounted a fixed USB camera (an Avaya HC020) beside the PTZ camera. It c
   2. **The PTZ-picture correction wound up without limit.** It added the previous correction on top of an error that had been measured from the camera's real pose, so it counted the correction twice. Any small constant error, such as a latency one frame off, then ratcheted up.
   3. **The simulator itself was wrong.** Its "late" PTZ picture combined the current scene with an old pose, so it reported trailing that wasn't there. A real picture is late as a whole.
 
-  After fixing all three, over 108 cases the walker stayed in frame 100 % of the time, with no overshoot. A deliberate 1° map error was cut from 0.06–0.11 of the frame to 0.01–0.02 by the correction from the PTZ's picture.
+  After fixing all three, over 108 cases the walker stayed in frame 100 % of the time. With the lens measured there was no zoom overshoot; with the assumed lens model, 24 cases zoomed up to 1.45× too far, the same limit as PTZ mode, so measure the lens. A deliberate 1° map error was cut from 0.06–0.11 of the frame to 0.01–0.02 by the correction from the PTZ's picture.
 - **Work out the storage before adding a second clip per event.**
   - The 3 GB cap already held only about 5 h of events.
   - A wide clip for every event would have halved that, so by default a wide clip is kept only when the PTZ's clip doesn't show the whole scene.
@@ -212,11 +212,26 @@ The user mounted a fixed USB camera (an Avaya HC020) beside the PTZ camera. It c
   - **Crash risk:** a `sys.exit` in a helper that the capture thread would have called, which would have stopped that thread for good when the camera was missing.
   - **Unsafe aim:** pan goals were not clamped to the calibrated range.
   - **Storage:** the arithmetic in the previous bullet.
-- **Reconnects reset USB settings.** A camera restart put anti-flicker back to 50 Hz and spoiled a day's test. The app now re-applies its USB settings on reconnect.
+- **Reconnects reset USB settings.** A camera restart put anti-flicker back to 50 Hz and spoiled a day's test. The app now re-applies its USB settings on reconnect, and the wide camera's crop too (the sync map only fits that crop).
+- **An adversarial review of the finished backend found 32 problems, and an independent check confirmed every one.** Each fix has a test that fails on the old code. The lessons behind them:
+  - **A decision about a camera must not depend on that camera's frames.** Whether to keep an event's wide clip was decided only on PTZ frames. So while the PTZ was offline, which is exactly when the wide clip is the only video, every wide clip was deleted. Shared decisions now run once a second from whichever camera is delivering frames.
+  - **What must survive a restart goes in the database.** That decision lived in memory, so clips recovered after a crash were all deleted. It is now saved with the event and also follows from what is stored (main camera, PTZ clip failed).
+  - **A "stop" must be its own request.** A stop that landed while an absolute move was being sent was overwritten by the send's own bookkeeping, and the camera drove on to the cancelled goal. Turning PTZ control off never stopped a swing at all. The stop is now a flag that only the worker clears.
+  - **Never replay a stale command.** A goal kept for de-duplication was sent again when VISCA came back, so the camera swung to where someone had been minutes earlier. A sent goal is now cleared, and one that cannot be sent is dropped.
+  - **A handover must not assume the old camera saw everything.** Marking everyone the new counter saw as counted lost every person a washed-out PTZ had missed. The two cameras' tracks are now matched by position, or, without the sync map, by number per kind of object.
+  - **"Where it was" is not "where it is".** A lost eye target's last position kept being matched in the PTZ picture, so passers-by were linked to its event. A click on the late PTZ picture was mapped through the camera's current pose instead of the pose that picture shows.
+  - **State text is not state.** A photo check compared the failover's reason string, which went stale after a brief outage. It now asks the selector whether the PTZ picture is clear, and the reason is recomputed every second.
+- **Review the fixes too.** A second adversarial review, of the fixes alone, found 19 more problems, several of them regressions the first round introduced:
+  - Clearing a sent goal (so it could not replay) also stopped a swing from resuming after a one-off read error.
+  - Re-finding a lost target by distance alone gave one person's count to another, walking the other way, and once locked onto someone standing still.
+  - A click on the PTZ view was mapped at the late picture's moment but compared with eye positions half a second newer: at walking pace that is the gap to the next person.
+  - A handover looked for "recent" counts as of now, but a failure is only noticed seconds later (5 s for an outage), and a whiting-out picture stops detecting before it is flagged. Recency now runs from when the old camera last worked.
+  - Two reviewers disagreed about photos without the sync map. The resolution came from geometry: the wide view contains the PTZ's view, not the other way round.
+- **Watch the real logs after deploying.** A start-up race made the wide camera main for two minutes (the PTZ stream sends its first picture a second later), and the eye's ffmpeg was quietly dropping frames whose jittery timestamps shared a 1/15 s tick. Neither showed in any test.
 
 ## 8. Open items
 
-- **Sync the cameras** with `tools/calibrate_sync.py`, in daylight, with both looking at the street. Then check live follows driven by the wide camera, and the counts against the PTZ's history.
+- **Sync the cameras** with `tools/calibrate_sync.py`, in daylight, with both looking at the street. `tools/sync_when_clear.py` can wait for a clear moment and run it unattended. Then check live follows driven by the wide camera, and the counts against the PTZ's history.
 - **Fit the Active Cooler** before running both cameras: the Pi read 82.6 °C with one.
 - **Storage cap.** Consider raising it from 3 GB, since the card has about 99 GB free. Then evidence is kept for more than a few hours.
 

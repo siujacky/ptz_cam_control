@@ -149,7 +149,7 @@ class CommandTests(unittest.TestCase):
                 "-f", "v4l2", "-input_format", "h264", "-video_size", "1920x1080", "-framerate", "15",
                 "-i", "/dev/video2",
                 "-map", "0:v:0", "-c:v", "copy", *segment_output_args(ring, 2, start_n),
-                "-map", "0:v:0", "-vf", "scale=1280:720:flags=bilinear", "-fps_mode", "passthrough", "-pix_fmt", "bgr24", "-f", "rawvideo",
+                "-map", "0:v:0", "-vf", "scale=1280:720:flags=bilinear", "-fps_mode", "passthrough", "-enc_time_base", "-1", "-pix_fmt", "bgr24", "-f", "rawvideo",
                 "pipe:1"])
             self.assertEqual((cap.width, cap.height), (1280, 720))  # the size of the frames delivered
 
@@ -197,6 +197,17 @@ class ConnectTests(unittest.TestCase):
                         mock.patch("ptzcam.usbcam.uvc.write_control") as write:
                     capture(Path(d), anti_flicker=off)._cmd()
                 write.assert_not_called()
+
+    def test_the_sync_maps_crop_is_put_back_on_every_connect(self):
+        with tempfile.TemporaryDirectory() as d:
+            cap = capture(Path(d), anti_flicker=0)
+            cap.crop = {"zoom_absolute": 120, "pan_absolute": 3600}  # set by the pipeline from sync.json
+            with mock.patch("ptzcam.usbcam.uvc.find_device", return_value="/dev/video2"), \
+                    mock.patch("ptzcam.usbcam.uvc.write_control", return_value=(100, 120)) as write:
+                cap._cmd()
+                cap._cmd()  # a reconnect (a re-plug resets UVC controls)
+            names = [c.args[1] for c in write.call_args_list]
+            self.assertEqual(names, ["power_line_frequency", "zoom_absolute", "pan_absolute"] * 2)
 
     def test_refused_anti_flicker_still_connects(self):
         with tempfile.TemporaryDirectory() as d:

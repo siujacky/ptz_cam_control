@@ -74,10 +74,11 @@ This is a conference-room camera (ClearOne UNITE 200). In bright daylight its au
 
 A fixed USB wide camera (here an Avaya HC020, mounted beside the PTZ camera at the same window) can work with the PTZ camera. The app calls it the *eye*:
 
-- **It counts.** Its view never moves, so counting never pauses while the PTZ follows someone. It counts in your PTZ zone (or the PTZ's whole Home view) mapped into its picture, so the counted area stays the same.
-- **It steers the PTZ.** Once the two cameras are synced, the wide camera picks who to follow (people first). It points the PTZ straight at them with exact pan/tilt commands and zooms in one step from the size it measures. The PTZ's own picture then fine-tunes the aim. The PTZ no longer chases through its own picture, which lags half a second.
+- **It counts.** Its view never moves, so counting never pauses while the PTZ follows someone. It counts in your PTZ zone (or the PTZ's whole Home view) mapped into its picture, so the counted area stays the same. It takes over counting only once it knows where that is (the PTZ read at Home, or the Home view the sync recorded). When counting moves from one camera to the other, whoever the first already counted is not counted again, and everyone else still is.
+- **It steers the PTZ.** Once the two cameras are synced, the wide camera picks who to follow (people first, and only someone in the counting zone). It points the PTZ straight at them with exact pan/tilt commands and zooms in one step from the size it measures. The PTZ's own picture then fine-tunes the aim. The PTZ no longer chases through its own picture, which lags half a second. Someone who disappears behind a van for a few seconds is found again and keeps their count, and the PTZ goes Home after *Return home after* when there is nobody to follow.
 - **It takes over when the PTZ is washed out.** When the sun blinds the PTZ (or it goes offline), the live view, the event photos and the default clips come from the wide camera. They switch back once the PTZ picture has been clear for 2 minutes. The live view says which camera is showing and why.
-- **Clips.** Every event keeps the PTZ's clip. With *Wide clips: auto*, the wide camera's clip is kept only when the PTZ followed someone during the event or the wide camera was the main camera. Otherwise it adds nothing and costs storage.
+- **Photos come from the main camera.** While the wide camera counts and the PTZ is main, the PTZ's picture of the same person (matched through the sync) replaces the wide camera's photo. A washed-out PTZ picture never becomes a photo.
+- **Clips.** Every event keeps the PTZ's clip. With *Wide clips: auto*, the wide camera's clip is kept when the PTZ moved, followed someone or was offline during the event, the wide camera was the main camera, or the PTZ's clip failed. Otherwise it adds nothing and costs storage. The decision is saved with the event, so it holds across a restart.
 
 **Setting it up**
 
@@ -90,7 +91,11 @@ A fixed USB wide camera (here an Avaya HC020, mounted beside the PTZ camera at t
    .venv/bin/python tools/calibrate_sync.py
    sudo systemctl start ptzcam
    ```
-   Re-run it whenever either camera is moved or bumped. Until it has run, the wide camera still takes over when the PTZ is washed out, and the PTZ follows from its own picture as before.
+   Or let the Pi do it by itself at the next clear daytime moment: it waits until both pictures have been clear for 10 minutes, then stops the app for those 3 minutes. Settings → *Camera sync* shows its progress, or why it did not finish (`journalctl -u ptzcam-sync-once` has the details; `sudo systemctl stop ptzcam-sync-once` cancels it).
+   ```bash
+   sudo systemd-run --unit=ptzcam-sync-once /home/pi/ptz_cam/.venv/bin/python /home/pi/ptz_cam/tools/sync_when_clear.py
+   ```
+   Re-run it whenever either camera is moved or bumped. Until it has run, the wide camera still takes over when the PTZ is washed out, and the PTZ follows from its own picture as before. Settings → *Wide camera* says why the wide camera is not counting yet.
 
 **Settings**
 
@@ -99,7 +104,7 @@ A fixed USB wide camera (here an Avaya HC020, mounted beside the PTZ camera at t
 | *Count on the wide camera* (`eye.count`) | Counting comes from the wide camera when it can (needs the sync, or a zone drawn on the wide picture) |
 | *Wide camera steers the PTZ* (`eye.follow`) | The wide camera picks targets and aims the PTZ (needs the sync) |
 | *Wide clips* (`eye.clips`) | `auto`, `always` or `never` |
-| *Anti-flicker* (`eye.anti_flicker`) | Put back on every reconnect. Off helps in sunshine (see *Bright daylight*) |
+| *Anti-flicker* (`eye.anti_flicker`) | Applied at once, and put back whenever the camera resets it. Off helps in sunshine (see *Bright daylight*) |
 | *Failover* (`failover.mode`) | `auto` (the PTZ unless it is washed out or offline), or always the PTZ / the wide camera |
 | *Washed out at* / *after* / *back after* | How white (50 %), for how long (20 s) before switching, and how long clear (120 s) before switching back |
 

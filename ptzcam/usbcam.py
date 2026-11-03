@@ -19,9 +19,11 @@ class UsbCapture(FrameSource):
                  segment_seconds: int = 2, buffer_seconds: int = 120, anti_flicker=None, log=None, name: str = "eye"):
         """device: a camera name such as "Avaya HC020", or a path such as /dev/v4l/by-id/... The camera sends
         width x height H.264 at fps; frames are delivered at out_width x out_height. anti_flicker (None or -1 =
-        leave it, 0 off, 1 50 Hz, 2 60 Hz) is set on every (re)connect, because a re-plug resets it."""
+        leave it, 0 off, 1 50 Hz, 2 60 Hz) is set on every (re)connect, because a re-plug resets it; so is `crop`
+        ({control: value}, the digital pan/tilt/zoom the sync map was measured with), which the pipeline sets."""
         super().__init__(device, out_width, out_height, fps, log=log, name=name)
         self.device, self.capture_size, self.anti_flicker = device, (width, height), anti_flicker
+        self.crop = {}
         self.node = None  # the device node in use
         self._missing = False
         self.ring = Recorder(None, ring_dir, segment_seconds, buffer_seconds,
@@ -45,6 +47,7 @@ class UsbCapture(FrameSource):
     def _cmd(self) -> list:
         dev = self._find()
         self._set_anti_flicker(dev)
+        self._set_crop(dev)
         ring = self.ring.seg_dir
         ring.mkdir(parents=True, exist_ok=True)  # re-created every time, as Recorder._supervise does
         w, h = self.capture_size
@@ -56,6 +59,10 @@ class UsbCapture(FrameSource):
                 *segment_output_args(ring, self.ring.segment_seconds, next_start_number(ring)),
                 "-map", "0:v:0", "-vf", f"scale={self.width}:{self.height}:flags=bilinear",
                 "-fps_mode", "passthrough",  # after a stall, no burst of repeated frames with fresh times
+                # The camera's frame times jitter (52, 68, 80 ms apart): on the default 1/15 s encoder clock two of them
+                # can land on one tick, and the muxer then drops the second (up to a third of the frames at times,
+                # each with a "non monotonically increasing dts" error). Its own clock keeps them apart.
+                "-enc_time_base", "-1",
                 "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
 
     def _find(self) -> str:
@@ -81,6 +88,16 @@ class UsbCapture(FrameSource):
             return
         if old != new:
             self.log.info("anti-flicker %s -> %s", old, new)
+
+    def _set_crop(self, dev: str):
+        for name, value in dict(self.crop).items():
+            try:
+                old, new = uvc.write_control(dev, name, value)
+            except (OSError, LookupError) as e:
+                self.log.warning("could not set %s to %s: %s", name, value, e)
+                continue
+            if old != new:
+                self.log.info("%s %s -> %s (the sync map's crop)", name, old, new)
 
     def _stalled(self):
         """As FrameSource's, and also when frames still arrive but the ring has stopped growing."""

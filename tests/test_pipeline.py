@@ -6,6 +6,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -14,6 +15,7 @@ from ptzcam import failover, pipeline
 from ptzcam.config import ConfigStore
 from ptzcam.detector import Detection
 from ptzcam.ptz import EYE_ID_BASE
+from ptzcam.sync import SyncMap
 from ptzcam.storage import Storage
 from tests.helpers import FakeBus
 
@@ -30,6 +32,7 @@ class FakeSource:
         self._id, self._ts = 0, 0.0
         self._stop = threading.Event()
         self.ring = FakeRecorder()
+        self.anti_flicker, self.crop, self.node = -1, {}, None  # as UsbCapture has, for the eye
 
     def start(self, recover=()):
         threading.Thread(target=self._run, daemon=True).start()
@@ -37,11 +40,12 @@ class FakeSource:
     def _run(self):
         t0 = time.time()
         while not self._stop.is_set():
-            frame = self.scene(time.time() - t0)
-            with self._cond:
-                self._frame, self._ts = frame, time.time()
-                self._id += 1
-                self._cond.notify_all()
+            frame = self.scene(time.time() - t0) if self.scene is not None else None  # None: offline
+            if frame is not None:
+                with self._cond:
+                    self._frame, self._ts = frame, time.time()
+                    self._id += 1
+                    self._cond.notify_all()
             time.sleep(1 / 15)
 
     def stop(self):
@@ -201,6 +205,261 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("main", self.bus.names())
         state["white"] = False
         self.assertTrue(self.wait(lambda: p.selector.main == "ptz", timeout=20))
+
+
+def linear_sync(home=None):
+    """A sync map for a PTZ whose Home view is the middle of the eye's picture (half its size, at zoom 0)."""
+    rows = [[u, v, -1000 + 2000 * u, 300 - 900 * v, 0.5, 0.5]
+            for u in np.linspace(0.05, 0.95, 7) for v in np.linspace(0.05, 0.95, 5)]
+    m = SyncMap(np.array(rows), ptz_zoom=0, eye_size=(1920, 1080), tilt_limits=(-432.0, 400.0))
+    if home is not None:
+        m.meta["ptz_home"] = list(home)
+    return m
+
+
+def track(tid, cat, x, y, ts, h=0.2, counted=False, first_ts=0.0, event_id=None, moving=True):
+    w = h * 0.4
+    return SimpleNamespace(id=tid, category=cat, confirmed=True, counted=counted, last_ts=ts, first_ts=first_ts,
+                           box=np.array([x - w / 2, y - h / 2, x + w / 2, y + h / 2]), center=(x, y),
+                           vel=np.zeros(2), event_id=event_id, moving=moving, max_score=0.9, in_zone=False)
+
+
+def counted_by(p, role, tracks):
+    """What camera `role` counted, as its loop remembers it."""
+    for t in tracks:
+        p._remember_counted(role, [t], t.last_ts)
+
+
+class ReviewFixesTest(unittest.TestCase):
+    """Behaviour the dual-camera review asked for."""
+    make, wait, counted = PipelineTest.make, PipelineTest.wait, PipelineTest.counted
+
+    def stopped(self, **kw):
+        """A pipeline whose loops are stopped, so tests can set the trackers' tracks themselves."""
+        p = self.make(**kw)
+        for u in p.units.values():
+            u.stop.set()
+        for u in p.units.values():
+            u.thread.join(10)
+        return p
+
+    def test_an_offline_ptz_keeps_every_events_wide_clip(self):
+        patcher = mock.patch.object(pipeline, "STARTUP_GRACE_S", 1.0)  # it never starts: no need to wait 15 s
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        p = self.make(eye=True, ptz_scene=None)  # the PTZ stream is down
+        self.assertTrue(self.wait(lambda: p.selector.main == "eye", timeout=10))
+        self.assertTrue(self.wait(lambda: any(r["camera"] == "eye" for r in self.counted()), timeout=15))
+        self.assertTrue(self.wait(lambda: all(r["clip_wide_keep"] for r in self.storage._all(
+            "SELECT clip_wide_keep FROM events WHERE start_ts > 0"))))
+
+    def test_the_eye_counts_on_the_ptz_view_only_once_it_knows_where_that_is(self):
+        p = self.make(eye=True)
+        p.cfg.data["eye"]["zone"] = []  # count on the PTZ's Home view, mapped
+        self.assertTrue(self.wait(lambda: p.units["eye"].fps > 0))
+        p.sync = p.autotracker.sync = linear_sync()  # mapped, but the PTZ has not been read at Home
+        time.sleep(1.5)
+        self.assertEqual(p.counting, "ptz")  # not the whole wide view
+        self.assertEqual(p._zone_for_eye(p.cfg.data), [])
+        p.sync = p.autotracker.sync = linear_sync(home=(0, -150, 0))  # as the calibration found Home
+        self.assertTrue(self.wait(lambda: p.counting == "eye", timeout=5))
+        zone = p._zone_for_eye(p.cfg.data)
+        self.assertAlmostEqual(zone[0][0], 0.25, delta=0.02)  # the Home view: the middle half of the eye's
+        self.assertAlmostEqual(zone[2][0], 0.75, delta=0.02)
+
+    def test_a_handover_counts_what_the_old_camera_never_counted(self):
+        p = self.stopped(eye=True)
+        now, cfg = time.time(), p.cfg.data
+        eye = p.units["eye"].tracker
+        # No sync map: as many as the PTZ has counted in view, the longest seen first.
+        counted_by(p, "ptz", [track(5, "person", 0.5, 0.5, now, counted=True, event_id=3)])
+        eye.tracks = [track(EYE_ID_BASE + 1, "person", 0.4, 0.5, now, first_ts=now - 9),
+                      track(EYE_ID_BASE + 2, "person", 0.6, 0.5, now, first_ts=now - 2)]
+        self.assertEqual(p._hand_over("ptz", "eye", cfg), 1)
+        self.assertEqual([(t.counted, t.event_id) for t in eye.tracks], [(True, 3), (False, None)])
+        # A washed-out PTZ that has counted nobody lately: everyone the eye sees still counts.
+        p._counted["ptz"].clear()
+        counted_by(p, "ptz", [track(6, "person", 0.5, 0.5, now - 20, counted=True)])  # long gone
+        eye.tracks = [track(EYE_ID_BASE + 3, "person", 0.4, 0.5, now)]
+        self.assertEqual(p._hand_over("ptz", "eye", cfg), 0)
+        self.assertFalse(eye.tracks[0].counted)
+
+    def test_a_handover_after_an_outage_remembers_what_the_old_camera_counted(self):
+        p = self.stopped(eye=True, ptz_scene=None)
+        now, cfg = time.time(), p.cfg.data
+        # The PTZ counted a walker 6 s before counting moved (its stream dropped; seen as offline 5 s later). Its
+        # tracker has let go of the track, but the pipeline remembers it.
+        counted_by(p, "ptz", [track(5, "person", 0.5, 0.5, now - 6, counted=True, event_id=3)])
+        p.units["ptz"].source._ts = now - 6.0  # its last picture: offline (none for 5 s), last seen working then
+        eye = p.units["eye"].tracker
+        eye.tracks = [track(EYE_ID_BASE + 1, "person", 0.4, 0.5, now, first_ts=now - 9)]
+        self.assertEqual(p._hand_over("ptz", "eye", cfg), 1)
+        self.assertEqual((eye.tracks[0].counted, eye.tracks[0].event_id), (True, 3))
+
+    def test_a_handover_after_a_white_out_remembers_what_the_ptz_counted_before_it_faded(self):
+        p = self.stopped(eye=True)
+        now, cfg = time.time(), p.cfg.data
+        # The PTZ's detections faded 3.7 s before its picture was flagged blinded (3 s ago): its last count is 6.7 s old.
+        counted_by(p, "ptz", [track(5, "person", 0.5, 0.5, now - 6.7, counted=True, event_id=3)])
+        p._last_det["ptz"] = now - 6.7
+        p.selector._blind_since = now - 3.0
+        eye = p.units["eye"].tracker
+        eye.tracks = [track(EYE_ID_BASE + 1, "person", 0.4, 0.5, now, first_ts=now - 9)]
+        self.assertEqual(p._hand_over("ptz", "eye", cfg), 1)
+        self.assertTrue(eye.tracks[0].counted)
+        # Long before (more than BAD_LEAD_S before the flags): someone who has gone; nothing to carry over.
+        p._counted["ptz"].clear()
+        eye.tracks[0].counted = False
+        counted_by(p, "ptz", [track(6, "person", 0.5, 0.5, now - 25, counted=True, event_id=2)])
+        p._last_det["ptz"] = now - 25
+        self.assertEqual(p._hand_over("ptz", "eye", cfg), 0)
+        self.assertFalse(eye.tracks[0].counted)
+
+    def test_a_count_handover_never_pairs_something_that_could_not_be_counted(self):
+        p = self.stopped(eye=True)
+        now, cfg = time.time(), p.cfg.data
+        counted_by(p, "ptz", [track(5, "person", 0.5, 0.5, now, counted=True, event_id=3)])
+        eye = p.units["eye"].tracker
+        eye.tracks = [track(EYE_ID_BASE + 1, "person", 0.2, 0.5, now, first_ts=now - 60, moving=False),  # waiting
+                      track(EYE_ID_BASE + 2, "person", 0.6, 0.5, now, first_ts=now - 4)]  # the walker
+        self.assertEqual(p._hand_over("ptz", "eye", cfg), 1)
+        self.assertEqual([t.counted for t in eye.tracks], [False, True])
+
+    def test_a_handover_matches_by_position_through_the_sync_map(self):
+        p = self.stopped(eye=True)
+        p.sync = linear_sync(home=(0, -150, 0))  # PTZ control is off in these tests: it shows its Home view
+        now, cfg = time.time(), p.cfg.data
+        # The PTZ counted someone a quarter of its frame right of centre: in the eye, at u = 0.5 + 0.25 * 0.5.
+        counted_by(p, "ptz", [track(5, "person", 0.75, 0.5, now, h=0.2, counted=True, event_id=3)])
+        eye = p.units["eye"].tracker
+        eye.tracks = [track(EYE_ID_BASE + 1, "person", 0.2, 0.5, now, h=0.1, first_ts=now - 9),  # outside its view
+                      track(EYE_ID_BASE + 2, "person", 0.625, 0.5, now, h=0.1)]
+        self.assertEqual(p._hand_over("ptz", "eye", cfg), 1)
+        self.assertEqual([t.counted for t in eye.tracks], [False, True])
+
+    def test_the_main_cameras_tracks_join_the_event_the_other_camera_counted(self):
+        p = self.stopped(eye=True)
+        p.sync = linear_sync(home=(0, -150, 0))
+        p.counting = "eye"
+        now, cfg = time.time(), p.cfg.data
+
+        class Active:
+            id = 9
+        p.events.active = Active()
+        p.units["eye"].tracker.tracks = [track(EYE_ID_BASE + 1, "person", 0.625, 0.5, now, h=0.1, counted=True,
+                                               event_id=9)]
+        mine = [track(5, "person", 0.75, 0.5, now), track(6, "person", 0.2, 0.5, now)]
+        p._link_to_counter("ptz", mine, now, cfg)
+        p.events.active = None
+        self.assertEqual([(t.event_id, t.counted) for t in mine], [(9, True), (None, False)])
+
+    def test_renames_and_the_eyes_anti_flicker_apply_without_a_restart(self):
+        p = self.stopped(eye=True)
+        p.cfg.data["camera"]["name"], p.cfg.data["eye"]["name"] = "Street", "Garden"
+        st = p.status()
+        self.assertEqual((st["cameras"]["ptz"]["name"], st["cameras"]["eye"]["name"]), ("Street", "Garden"))
+        self.assertEqual(st["camera"]["name"], "Street")
+        p.cfg.data["eye"]["anti_flicker"] = 0
+        with mock.patch("ptzcam.uvc.find_device", return_value="/dev/video9"), \
+                mock.patch("ptzcam.uvc.read_control", return_value=1), \
+                mock.patch("ptzcam.uvc.write_control", return_value=(1, 0)) as write:
+            p._eye_controls(p.cfg.data, check=False)
+            p._eye_controls(p.cfg.data, check=False)  # once: the capture now holds the new value
+        write.assert_called_once_with("/dev/video9", "power_line_frequency", 0)
+        self.assertEqual(p.units["eye"].source.anti_flicker, 0)  # what it sets on its next connect
+
+    def test_the_status_says_why_the_eye_does_not_count(self):
+        p = self.stopped(eye=True)
+        cfg = p.cfg.data
+        p.counting = "eye"
+        self.assertEqual(p.status()["counting_note"], "")
+        p.counting = "ptz"
+        cfg["eye"]["zone"] = []
+        self.assertIn("needs the camera sync", p.status()["counting_note"])
+        p.sync = linear_sync()  # synced, but the PTZ's Home has not been read
+        self.assertIn("Home view", p.status()["counting_note"])
+        cfg["eye"]["count"] = False
+        self.assertEqual(p.status()["counting_note"], "counting on the wide camera is off")
+
+    def test_the_unattended_syncs_progress_is_shown_while_it_runs(self):
+        import json as _json
+        import os
+        p = self.stopped(eye=True)
+        path = p.cfg.resolve(p.cfg.data["storage"]["data_dir"]) / "sync_pending.json"
+        now = time.time()
+        for state, pid, updated, shown in (("waiting", os.getpid(), now, True),
+                                           ("waiting", 999999, now, False),  # its process has gone
+                                           ("waiting", os.getpid(), now - 3600, False),  # stopped writing
+                                           ("failed", 999999, now - 3600, True),  # a failure is kept a day
+                                           ("failed", 999999, now - 2 * 86400, False)):
+            path.write_text(_json.dumps({"pid": pid, "state": state, "since": now - 60, "clear_for": 240,
+                                         "need": 600, "updated": updated, "error": "x" if state == "failed" else None}))
+            p._read_sync_pending()
+            got = p.status()["sync"]["scheduled"]
+            self.assertEqual(got is not None, shown, (state, pid, updated, got))
+            if shown:
+                self.assertEqual(got["state"], state)
+        path.unlink()
+        p._read_sync_pending()
+        self.assertIsNone(p.status()["sync"]["scheduled"])
+
+    def test_a_main_camera_switch_carries_its_time(self):
+        state = {"white": False}
+        p = self.make(eye=True, ptz_scene=lambda t: walker(t, white=state["white"]))
+        self.assertTrue(self.wait(lambda: p.units["ptz"].fps > 0 and p.units["eye"].fps > 0))
+        state["white"] = True
+        self.assertTrue(self.wait(lambda: "main" in self.bus.names(), timeout=15))
+        ev = [d for n, d in self.bus.messages if n == "main"][-1]
+        self.assertEqual(ev["camera"], "eye")
+        self.assertAlmostEqual(ev["since"], p.selector.since)
+        self.assertGreater(ev["since"], 0)
+
+    def test_a_camera_still_starting_is_not_taken_for_offline(self):
+        slow = {"t0": None}
+
+        def late(t):  # the PTZ stream sends its first picture 3 s after the start
+            return walker(t) if t > 3.0 else None
+        p = self.make(eye=True, ptz_scene=late)
+        time.sleep(2.0)
+        self.assertEqual(p.selector.main, "ptz")  # the eye was quicker, but the PTZ is only starting
+        self.assertTrue(self.wait(lambda: p.units["ptz"].online, timeout=8))
+        time.sleep(1.5)
+        self.assertEqual(p.selector.main, "ptz")
+        self.assertNotIn("main", self.bus.names())
+
+    def test_a_broken_crop_in_the_sync_file_never_stops_the_start(self):
+        import json as _json
+        p = self.stopped(eye=True)
+        m = linear_sync()
+        for bad in (1, True, 2.5, "x", [1, 2]):
+            with self.subTest(eye_eptz=bad):
+                m.meta["eye_eptz"] = bad
+                with mock.patch("ptzcam.uvc.find_device", side_effect=LookupError("no camera")):
+                    p._set_eye_crop(m)
+                self.assertEqual(p.units["eye"].source.crop, {})
+        path = p.cfg.resolve(p.cfg.data["storage"]["data_dir"]) / "sync.json"
+        d = m.to_json()
+        d["meta"]["eye_eptz"] = 1
+        path.write_text(_json.dumps(d))
+        p._stop_all()
+        with mock.patch("ptzcam.uvc.find_device", side_effect=LookupError("no camera")):
+            p._start()  # must not raise
+        self.assertTrue(all(u.thread.is_alive() for u in p.units.values()))
+
+    def test_a_crop_value_that_is_not_a_number_keeps_the_map(self):
+        p = self.stopped(eye=True)
+        m = linear_sync()
+        m.meta["eye_eptz"] = {"zoom_absolute": float("nan"), "pan_absolute": float("inf"), "tilt_absolute": 3600}
+        with mock.patch("ptzcam.uvc.find_device", side_effect=LookupError("no camera")):
+            p._set_eye_crop(m)
+        self.assertEqual(p.units["eye"].source.crop, {"tilt_absolute": 3600})
+
+    def test_an_error_in_housekeeping_does_not_end_a_cameras_loop(self):
+        p = self.make(eye=True, ptz_scene=None, eye_scene=None)  # both offline: housekeeping runs on that path
+        with mock.patch.object(p, "_update_counting", side_effect=RuntimeError("boom")):
+            time.sleep(2.5)
+        self.assertTrue(p.units["ptz"].thread.is_alive())
+        self.assertTrue(p.units["eye"].thread.is_alive())
 
 
 if __name__ == "__main__":

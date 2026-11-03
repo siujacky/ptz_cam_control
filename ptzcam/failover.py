@@ -27,22 +27,41 @@ class MainSelector:
     def __init__(self):
         self.main, self.reason, self.since = "ptz", "PTZ camera", 0.0
         self._white_since = self._blind_since = self._clear_since = None
+        self._unfit = False  # washed out or offline, and not clear again since
         self.history = deque(maxlen=50)  # (ts, camera, reason) for the status and the log
 
     def tick(self, now: float, cfg: dict, ptz: Health, eye: Health | None) -> bool:
-        """Re-decide (call about once a second). Returns True when the main camera changed."""
+        """Re-decide (call about once a second). Returns True when the main camera changed. `reason` always says
+        why the main camera is the one it is now; `history` keeps why each switch happened."""
         self._track(now, cfg, ptz)
         want, why = self._decide(now, cfg, ptz, eye)
         if want == self.main:
-            if why:
-                self.reason = why
+            self.reason = why
             return False
         offline = "offline" in why
-        if not offline and now - self.since < MIN_DWELL_S:
+        if not offline and now - self.since < MIN_DWELL_S:  # held for the minimum time on a camera
+            self.reason = f"switching to the {'PTZ' if want == 'ptz' else 'wide'} camera shortly"
             return False
         self.main, self.reason, self.since = want, why, now
         self.history.append((now, want, why))
         return True
+
+    @property
+    def ptz_clear(self) -> bool:
+        """The PTZ picture is clear now (online, not blinded, white well below the washed-out threshold)."""
+        return self._clear_since is not None
+
+    @property
+    def bad_since(self):
+        """When the PTZ picture went white or blinded (still now), or None."""
+        times = [t for t in (self._white_since, self._blind_since) if t is not None]
+        return min(times) if times else None
+
+    @property
+    def ptz_unfit(self) -> bool:
+        """The PTZ picture was washed out (or the PTZ offline) and has not been clear since: no photos from it while
+        the wide camera is main. A PTZ that was never washed out (e.g. the wide camera set as main) is fit."""
+        return self._unfit
 
     def _track(self, now, cfg, ptz):
         white = ptz.online and ptz.white >= cfg["white"]
@@ -50,6 +69,10 @@ class MainSelector:
         self._blind_since = (self._blind_since or now) if ptz.online and ptz.blinded else None
         clear = ptz.online and not ptz.blinded and ptz.white < cfg["white"] * CLEAR_FACTOR
         self._clear_since = (self._clear_since or now) if clear else None
+        if not ptz.online or self.washed_out(now, cfg):
+            self._unfit = True
+        elif clear:
+            self._unfit = False
 
     def washed_out(self, now: float, cfg: dict) -> bool:
         return (self._blind_since is not None and now - self._blind_since >= BLINDED_FOR_S) or \
@@ -69,9 +92,13 @@ class MainSelector:
         if self.main == "ptz":
             if self.washed_out(now, cfg) and eye_better:
                 return "eye", "PTZ picture washed out"
-            return "ptz", None
+            return "ptz", "PTZ camera"
         if self._clear_since is not None and now - self._clear_since >= cfg["return_after"]:
             return "ptz", "PTZ picture clear again"
         if eye.blinded and not ptz.blinded:  # both washed out: the eye was no better after all
             return "ptz", "wide camera washed out too"
-        return "eye", None
+        if self._clear_since is not None:
+            return "eye", "PTZ picture clearing up"
+        if ptz.blinded or ptz.white >= cfg["white"]:
+            return "eye", "PTZ picture washed out"
+        return "eye", "PTZ picture not clear yet"
