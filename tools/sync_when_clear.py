@@ -22,7 +22,9 @@ STEADY_S = 10 * 60
 MAX_WAIT_S = 48 * 3600
 ATTEMPTS = 3  # a failed calibration (the PTZ dropped off the network, a cloud mid-sweep) is tried again...
 RETRY_GAP_S = 30 * 60  # ...after this, at the next clear moment
-HOURS = (7, 16)  # local hours in which the street is lit but the sun is not yet low in the window
+# Local hours (Pi clock) to consider at all. The picture checks below are what matter: this window faces the
+# morning sun, which washes the PTZ out from about 7:00 (2026-10-31), so the early morning is often the best time.
+HOURS = (5, 18)
 POLL_S = 30
 
 
@@ -52,8 +54,9 @@ def report(state: str, **extra):
 
 
 def clear(c: dict) -> bool:
+    # Burnt white is what spoils matching; a bright picture with little of it is fine.
     return (c.get("online") and not c.get("blinded") and not c.get("night") and (c.get("white") or 0) < 2.0
-            and 60 < (c.get("luma") or 0) < 200)
+            and 60 < (c.get("luma") or 0) < 230)
 
 
 def status():
