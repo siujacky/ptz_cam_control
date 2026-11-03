@@ -274,9 +274,18 @@ async def api_status(request):
     return web.json_response(await _run(build_status, request.app[CTX]))
 
 
+def _camera(request):
+    """?camera=main (default: whichever is main right now), ptz or eye."""
+    cam = request.query.get("camera", "main")
+    return cam if cam in ("main", "ptz", "eye") else None
+
+
 async def api_live(request):
     ctx = request.app[CTX]
     overlay = request.query.get("overlay", "1") != "0"
+    cam = _camera(request)
+    if cam is None:
+        return _error("camera must be main, ptz or eye")
     try:
         width = int(request.query.get("width", ctx.cfg.data["web"]["live_width"]))
     except ValueError:
@@ -288,14 +297,15 @@ async def api_live(request):
     })
     await resp.prepare(request)
     loop = asyncio.get_running_loop()
-    last_id, last_sent = -1, 0.0
+    last_id, last_sent = None, 0.0
     try:
         while True:
             interval = 1.0 / ctx.cfg.data["web"]["live_fps"]
-            fid = ctx.pipeline.live.frame_id
+            live = ctx.pipeline.live_for(cam)  # re-read each time: "main" follows a failover at once
+            fid = (id(live), live.frame_id)
             now = loop.time()
             if fid != last_id or now - last_sent > 2.0:  # repeat the last frame every 2 s (shows "offline")
-                jpg = await loop.run_in_executor(None, ctx.pipeline.live.jpeg, overlay, width)
+                jpg = await loop.run_in_executor(None, live.jpeg, overlay, width)
                 await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(jpg)
                                  + jpg + b"\r\n")
                 last_id, last_sent = fid, now
@@ -312,7 +322,10 @@ async def api_frame(request):
         width = min(max(int(request.query.get("width", 1280)), 160), 1920) // 2 * 2
     except ValueError:
         return _error("width must be an integer")
-    jpg = await _run(ctx.pipeline.live.jpeg, overlay, width, 88)
+    cam = _camera(request)
+    if cam is None:
+        return _error("camera must be main, ptz or eye")
+    jpg = await _run(ctx.pipeline.live_for(cam).jpeg, overlay, width, 88)
     return web.Response(body=jpg, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 

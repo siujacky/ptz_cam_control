@@ -1,6 +1,7 @@
 """Decodes the camera stream with ffmpeg into BGR frames, keeping only the newest one."""
 from __future__ import annotations
 
+import fcntl
 import logging
 import re
 import subprocess
@@ -14,6 +15,11 @@ from .proc import spawn, terminate
 STALL_SECONDS = 15.0
 
 
+class SourceUnavailable(Exception):
+    """Raised by _cmd() when the input is not there (e.g. a USB camera unplugged): nothing is started, and the
+    next try follows the usual back-off."""
+
+
 def is_file_source(url: str) -> bool:
     return not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url)
 
@@ -25,10 +31,23 @@ def input_args(url: str) -> list:
     return ["-rtsp_transport", "tcp", "-timeout", "5000000", "-i", url]
 
 
+def _grow_pipe(pipe, size=1 << 20):
+    """A frame is 2.76 MB: a 64 KiB pipe needs 43 reads for it, and while the reader lags, ffmpeg (which for the
+    eye camera also writes the recording ring) waits. 1 MiB is the kernel's default limit for unprivileged pipes."""
+    try:
+        fcntl.fcntl(pipe.fileno(), 1031, size)  # F_SETPIPE_SZ
+    except Exception:  # not a real pipe (tests), or the kernel refuses: the default size works too
+        pass
+
+
 class FrameSource:
-    def __init__(self, url: str, width: int, height: int, fps: int, log=None):
+    def __init__(self, url: str, width: int, height: int, fps: int, log=None, name: str | None = None):
+        """`name` (e.g. "eye") tells two sources apart in the journal: it names the logger child, the threads
+        and ffmpeg's stderr lines."""
         self.url, self.width, self.height, self.target_fps = url, width, height, fps
-        self.log = log or logging.getLogger("ptzcam.camera")
+        log = log or logging.getLogger("ptzcam.camera")
+        self.log = log.getChild(name) if name else log
+        self._tag = name or "decoder"
         self.fps = 0.0
         self._cond = threading.Condition()
         self._frame = None
@@ -37,8 +56,9 @@ class FrameSource:
         self._proc = None
         self._proc_started = 0.0
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="frame-source", daemon=True)
-        self._watchdog = threading.Thread(target=self._watch, name="frame-watchdog", daemon=True)
+        self._spawn_lock = threading.Lock()  # so stop() cannot miss an ffmpeg that is being started
+        self._thread = threading.Thread(target=self._run, name=f"{name or 'frame'}-source", daemon=True)
+        self._watchdog = threading.Thread(target=self._watch, name=f"{name or 'frame'}-watchdog", daemon=True)
 
     def start(self):
         self._thread.start()
@@ -46,7 +66,9 @@ class FrameSource:
 
     def stop(self):
         self._stop.set()
-        terminate(self._proc)
+        with self._spawn_lock:  # an ffmpeg being started now is the one stopped; no other starts after this
+            proc = self._proc
+        terminate(proc)
         with self._cond:
             self._cond.notify_all()
         if self._thread.is_alive():
@@ -85,10 +107,18 @@ class FrameSource:
         size = self.width * self.height * 3
         while not self._stop.is_set():
             started = time.time()
+            missing = False
             try:
                 self._proc_started = started
-                self._proc = spawn(self._cmd(), self.log, "decoder", stdout=subprocess.PIPE)
+                cmd = self._cmd()
+                with self._spawn_lock:
+                    if self._stop.is_set():  # stop() came while _cmd() ran
+                        break
+                    self._proc = spawn(cmd, self.log, self._tag, stdout=subprocess.PIPE)
+                _grow_pipe(self._proc.stdout)
                 self._read_frames(self._proc.stdout, size)
+            except SourceUnavailable:
+                missing = True  # _cmd() has said why, once
             except Exception:
                 self.log.exception("frame source failed")
             finally:
@@ -97,13 +127,14 @@ class FrameSource:
                 break
             if time.time() - started > 30:
                 backoff = 1.0
-            self.log.warning("camera stream ended; reconnecting in %.0f s", backoff)
+            if not missing:
+                self.log.warning("camera stream ended; reconnecting in %.0f s", backoff)
             self._stop.wait(backoff)
             backoff = min(backoff * 2, 30.0)
 
     def _read_frames(self, pipe, size: int):
         last = None
-        while not self._stop.is_set():
+        while True:  # until EOF, also when stopping: ffmpeg must not block on a full pipe while it closes its files
             buf = bytearray(size)  # fresh buffer per frame, so consumers may keep a reference
             view = memoryview(buf)
             got = 0
@@ -129,8 +160,14 @@ class FrameSource:
             proc = self._proc
             if proc is None or proc.poll() is not None:
                 continue
-            since = max(self._frame_ts, self._proc_started)
-            if time.time() - since > STALL_SECONDS:
-                self.log.warning("no frames for %.0f s; restarting decoder", STALL_SECONDS)
+            stalled = self._stalled()
+            if stalled:
+                self.log.warning("%s; restarting decoder", stalled)
                 self.fps = 0.0
                 proc.kill()
+
+    def _stalled(self):
+        """Why the running ffmpeg counts as stuck, or None."""
+        if time.time() - max(self._frame_ts, self._proc_started) > STALL_SECONDS:
+            return f"no frames for {STALL_SECONDS:.0f} s"
+        return None

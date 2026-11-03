@@ -180,7 +180,45 @@ These notes cover building and running PTZ Cam. The setup is a Raspberry Pi 5 wi
 - **Note what you leave changed** on the device, such as the anti-flicker test: when, and the old value.
 - **Say which clock.** Quote the user's local time, or say "Pi time".
 
-## 7. Open items
+## 7. Two cameras (2 November)
+
+The user mounted a fixed USB camera (an Avaya HC020) beside the PTZ camera. It counts, steers the PTZ, and takes over when the PTZ is washed out.
+
+- **Check the two cameras see the same thing before comparing them.**
+  - The first comparison was meaningless: matching image features between the two pictures found nothing in common (0 consistent matches).
+  - The wide camera was pointing into the lit room.
+- **Let the camera do the heavy video work.**
+  - Decoding the Avaya's 4K on the Pi ran at 0.7–0.8× real time on 2–3 cores, and the Pi went from 74 °C to 83 °C. That rules it out.
+  - The camera's own 1080p shows exactly the same field of view as its 4K: the match scale was 1.000. Its digital zoom (at most 1.77×) is a lossless crop.
+  - At 15 fps H.264 it keeps a fixed 30-frame GOP, so there is a keyframe every 2 s, matching the 2 s segments. Decoding costs about 0.3 of a core.
+- **Measure the hardware's limits before designing around them.**
+  - Absolute pan/tilt, `81 01 06 02`, was assumed missing until it was tried. It works, and it is what makes eye-driven aiming possible.
+  - The Hailo looked too slow for two cameras plus night vision: 36.6 fps with one thread.
+  - With a separate set of bindings per thread, two threads reach 70.4 fps, and 52.5 alongside Zero-DCE. The limit was the API's latency per call, not the chip.
+- **One V4L2 device, one reader.**
+  - Only one process can stream a USB camera. So one ffmpeg reads it and writes two outputs: the stream-copied recording ring and the decoded frames for detection.
+  - The recorder gained a passive mode, cutting clips from a ring another process writes.
+  - Two clips cut into one event folder at the same moment used to share a temporary listing file. Each output now has its own.
+- **Simulate before deploying, and check the simulator too.** The eye-driven controller looked right in unit tests. The closed-loop simulation found three problems:
+  1. **The camera trailed the walker.** Pursuit speed was chosen to reach each aim in 0.6 s, but the aim led by only about 0.4 s. The lead must be the eye's lag plus the same arrival time.
+  2. **The PTZ-picture correction wound up without limit.** It added the previous correction on top of an error that had been measured from the camera's real pose, so it counted the correction twice. Any small constant error, such as a latency one frame off, then ratcheted up.
+  3. **The simulator itself was wrong.** Its "late" PTZ picture combined the current scene with an old pose, so it reported trailing that wasn't there. A real picture is late as a whole.
+
+  After fixing all three, over 108 cases the walker stayed in frame 100 % of the time, with no overshoot. A deliberate 1° map error was cut from 0.06–0.11 of the frame to 0.01–0.02 by the correction from the PTZ's picture.
+- **Work out the storage before adding a second clip per event.**
+  - The 3 GB cap already held only about 5 h of events.
+  - A wide clip for every event would have halved that, so by default a wide clip is kept only when the PTZ's clip doesn't show the whole scene.
+- **An independent critic earned its keep.** It caught three problems:
+  - **Crash risk:** a `sys.exit` in a helper that the capture thread would have called, which would have stopped that thread for good when the camera was missing.
+  - **Unsafe aim:** pan goals were not clamped to the calibrated range.
+  - **Storage:** the arithmetic in the previous bullet.
+- **Reconnects reset USB settings.** A camera restart put anti-flicker back to 50 Hz and spoiled a day's test. The app now re-applies its USB settings on reconnect.
+
+## 8. Open items
+
+- **Sync the cameras** with `tools/calibrate_sync.py`, in daylight, with both looking at the street. Then check live follows driven by the wide camera, and the counts against the PTZ's history.
+- **Fit the Active Cooler** before running both cameras: the Pi read 82.6 °C with one.
+- **Storage cap.** Consider raising it from 3 GB, since the card has about 99 GB free. Then evidence is kept for more than a few hours.
 
 - **Anti-flicker verdict.**
   - It hasn't been tested yet. The camera restarted on the morning of 1 November, and that put anti-flicker back to 50 Hz. A camera restart undoes it, so the app should re-apply it whenever the camera reconnects.

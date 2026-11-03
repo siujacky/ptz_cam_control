@@ -17,6 +17,8 @@ import time
 import urllib.request
 from collections import deque
 
+import numpy as np
+
 PAN_MAX, TILT_MAX = 0x18, 0x14
 STOP = (1, 1, 3, 3)  # pan speed, tilt speed, pan dir, tilt dir (3 = stop)
 PRESET_TRAVEL_S = 3.0  # assume the camera is moving this long after a preset/home recall
@@ -41,6 +43,8 @@ RIDER = {"person", "bicycle", "motorcycle"}
 # Slow and few: worth coasting after and re-finding as a new detection. While the camera pans, every parked car
 # that comes into view is a new detection too, so a lost vehicle is only re-found among things seen moving.
 SLOW = {"person", "bicycle", "animal"}
+# Track ids of the eye camera's tracker start here, so one id never means two objects (API, UI, auto-follow).
+EYE_ID_BASE = 1_000_000
 
 
 class ViscaError(Exception):
@@ -718,6 +722,21 @@ class AutoTracker:
     ZOOM_IN_MAX_VEL = 0.1    # ...and drifts slower than this (frame sizes per second): the camera keeps up
     EDGE = 0.02              # a box this close to the frame border is about to leave it
     MANUAL_PAUSE = 10.0      # manual PTZ input suspends auto-follow this long
+    # Eye mode: the fixed eye camera picks the target and the sync map aims the PTZ at it (see update_eye).
+    EYE_LAT_S = 0.15         # the eye's picture lag (USB and decoding)
+    AIM_PERIOD_S = 0.4       # re-aim at most this often while pursuing...
+    ARRIVE_S = 0.6           # ...at a speed that reaches each aim this long after it is sent (smooth pursuit)...
+    AIM_DEADBAND = 0.02      # ...and only when the aim moved by this share of the PTZ's field
+    ACQUIRE = 0.5            # an aim this far off (share of the field) is a fresh swing, sent at once at full speed
+    MAX_SLEW = 0.7           # follow only what needs at most this share of the camera's fastest pan/tilt
+    ZOOM_PERIOD_S = 1.0      # re-think the zoom at most this often
+    POINTED = 0.12           # pointed: within this share of the field of the aim...
+    POINTED_FOR = 0.4        # ...for this long, before zooming in
+    FIT = 0.3                # the target may drift this share of the field between aims, at most
+    PTZ_LAG_S = 0.6          # the PTZ picture shows the pose this long ago: refine only when it has been still
+    REFINE_RADIUS = 0.3      # a PTZ detection this close (share of its frame) to where the target should be is it
+    BIAS_GAIN = 0.4          # how much of each measured aiming error is corrected
+    BIAS_MAX = 0.5           # at most this share of the Home-zoom field
 
     def __init__(self, ptz: PTZController, cfg_store, log=None):
         self.ptz = ptz
@@ -725,6 +744,12 @@ class AutoTracker:
         self.log = log or logging.getLogger("ptzcam.autotrack")
         self.enabled = cfg_store.data["ptz"]["autotrack"]
         self.paused_until = 0.0
+        self.sync = None          # SyncMap (ptzcam/sync.py), set by the pipeline once calibrated
+        self.eye_active = False   # the eye camera is online and its picture usable (set by the pipeline)
+        self.ptz_usable = True    # the PTZ picture is not washed out (refinement and linking use it)
+        self.mode = "ptz"         # "eye" while the eye picks targets and the sync map aims the PTZ
+        self.ptz_match_id = None  # the PTZ track matched to the eye target (highlighted on the PTZ view)
+        self._lock = threading.RLock()  # the PTZ thread, the eye thread and the web thread all call in
         self.reset_target()
 
     def reset_target(self):
@@ -747,32 +772,70 @@ class AutoTracker:
         self._still_since = None
         self._pt_key = None
         self._pt_t = 0.0
+        # eye mode
+        self._aim_t = 0.0
+        self._aim = None         # last (pan, tilt) goal sent
+        self._aim_raw_tilt = None
+        self._bias = [0.0, 0.0]  # PTZ-picture corrections to the sync map's aim, in pan/tilt units
+        self._aim_bias = (0.0, 0.0)  # the correction the last aim was sent with
+        self._poses = deque(maxlen=90)  # (monotonic t, pan, tilt, zoom, bias): which pose a late PTZ picture shows
+        self._eye_h = deque(maxlen=5)  # the target's box height in the eye's picture
+        self._zoom_t = 0.0
+        self._pointed_since = None
+        self._ptz_pick = None    # a PTZ track the user clicked while the eye leads: matched to an eye track
+        self.ptz_match_id = None
 
     def set_enabled(self, enabled: bool, track_id=None):
-        self.enabled = enabled
-        self.paused_until = 0.0
-        self.reset_target()
-        if enabled:
-            self.target_id = track_id
-            self.user_locked = track_id is not None
-        else:
-            self.ptz.stop()
+        with self._lock:
+            self.enabled = enabled
+            self.paused_until = 0.0
+            self.reset_target()
+            if enabled:
+                if track_id is not None and self.mode == "eye" and track_id < EYE_ID_BASE:
+                    self._ptz_pick = track_id  # clicked on the PTZ view: find it in the eye's picture
+                    return
+                self.target_id = track_id
+                self.user_locked = track_id is not None
+            else:
+                self.ptz.stop()
 
     def resume(self):
         """End a manual-control pause (e.g. the user just saved this view as Home)."""
-        self.paused_until = 0.0
-        self.reset_target()
+        with self._lock:
+            self.paused_until = 0.0
+            self.reset_target()
 
     def paused_for(self) -> float:
         return max(0.0, self.paused_until - time.time()) if self.enabled else 0.0
 
     def manual_override(self):
-        if self.enabled:
-            self.paused_until = time.time() + self.MANUAL_PAUSE
+        with self._lock:
+            if self.enabled:
+                self.paused_until = time.time() + self.MANUAL_PAUSE
+                self.reset_target()
+                self.last_seen = self.paused_until  # the return-home countdown restarts after the pause
+
+    def _check_mode(self):
+        """Eye mode needs the sync map, a usable eye picture and absolute pan/tilt. Ids from one tracker mean
+        nothing to the other, so switching modes forgets the target."""
+        want = "eye" if (self.sync is not None and self.eye_active and self.ptz.can_point
+                         and self.cfg.data["eye"]["enabled"] and self.cfg.data["eye"]["follow"]) else "ptz"
+        if want != self.mode:
+            self.log.info("auto-follow: %s", "the wide camera picks targets and aims the PTZ" if want == "eye"
+                          else "the PTZ follows from its own picture")
+            self.mode = want
             self.reset_target()
-            self.last_seen = self.paused_until  # the return-home countdown restarts after the pause
+        return want
 
     def update(self, tracks, ts: float):
+        """Called for every PTZ frame with the PTZ tracker's tracks."""
+        with self._lock:
+            if self._check_mode() == "eye":
+                self._refine(tracks, ts)
+                return
+            self._update_ptz(tracks, ts)
+
+    def _update_ptz(self, tracks, ts: float):
         if not self.enabled or not self.ptz.enabled or ts < self.paused_until:
             return
         cfg = self.cfg.data["ptz"]
@@ -804,14 +867,14 @@ class AutoTracker:
         else:
             self._search(ts, lost_for, cfg)
 
-    def _countable(self, t) -> bool:
+    def _countable(self, t, zone=None) -> bool:
         """Only something that can become an event is worth leaving Home for: while the camera is away,
         nothing else in the scene can be counted."""
         det = self.cfg.data["detect"]
         c = det["categories"].get(t.category)
         if not c or not c["enabled"] or t.max_score < c["min_score"]:
             return False
-        return t.counted or not det["zone"] or t.in_zone
+        return t.counted or not (det["zone"] if zone is None else zone) or t.in_zone
 
     def _pick(self, visible, cfg, people_only=False):
         cands = [t for t in visible if t.moving and t.category in cfg["autotrack_categories"]
@@ -969,6 +1032,254 @@ class AutoTracker:
             self.log.info("nothing to follow; returning home")
             self.ptz.home()
             self.reset_target()
+
+    # ---- eye mode: the fixed eye camera picks the target, the sync map aims the PTZ at it ----
+    def update_eye(self, tracks, ts: float):
+        """Called for every eye frame with the eye tracker's tracks. The eye does not move, so its tracks show
+        how objects really move: no picture lag to steer through, no losses while the PTZ turns."""
+        with self._lock:
+            if self._check_mode() != "eye" or not self.enabled or not self.ptz.enabled or ts < self.paused_until:
+                return
+            cfg = self.cfg.data["ptz"]
+            visible = [t for t in tracks if t.confirmed and t.last_ts == ts]
+            if isinstance(self._ptz_pick, tuple):
+                self._take_ptz_pick(visible)
+            target = next((t for t in visible if t.id == self.target_id), None)
+            lost_for = ts - self.last_seen
+            if not self.user_locked:
+                pick = None
+                grace = self.COAST_S if self.target_category in SLOW else self.VEHICLE_GRACE
+                if target is None and (self.target_id is None or lost_for > grace):
+                    pick = self._pick_eye(visible, cfg)
+                elif target is not None and target.category != "person":
+                    pick = self._pick_eye(visible, cfg, people_only=True)
+                if pick is not None:
+                    self.log.info("%s %s #%d (wide camera)", "next:" if target is None and self.target_id is not None
+                                  else "following", pick.label, pick.id)
+                    self._set_eye_target(pick)
+                    target = pick
+            if target is not None:
+                self.last_seen, self.last_center, self._target, self.target_category = ts, target.center, target, target.category
+                self._eye_h.append(float(target.box[3] - target.box[1]))
+                self._steer(target.center, target.vel, cfg, zoom=cfg["autozoom"])
+            else:
+                self._eye_search(ts, lost_for, cfg)
+
+    def _set_eye_target(self, t):
+        self.target_id, self._target, self.target_category, self.user_locked = t.id, t, t.category, False
+        self._bias, self._aim, self._pointed_since, self.ptz_match_id = [0.0, 0.0], None, None, None
+        self._aim_bias = (0.0, 0.0)
+        self._eye_h.clear()
+        self._poses.clear()
+        self._widened = False
+
+    def _slew(self, t) -> float:
+        """Pan/tilt speed (units per second) that keeping `t` centred needs."""
+        vel = np.array(t.vel, float)
+        s, n = _image_speed(t), float(np.hypot(*vel))
+        if n > 1e-6 and s > n:  # the velocity estimate lags just after an object appears
+            vel *= s / n
+        return float(np.abs(self.sync.jacobian(*t.center) @ vel).max())
+
+    def _pick_eye(self, visible, cfg, people_only=False):
+        zone, top = self.cfg.data["eye"]["zone"], (cfg["pt_rate"] or PT_RATE) * self.MAX_SLEW
+        cands = [t for t in visible if t.moving and t.category in cfg["autotrack_categories"]
+                 and (t.category == "person" or not people_only) and self._countable(t, zone)
+                 and self.sync.covers(*t.center) and self._slew(t) <= top]
+        if not cands:
+            return None
+        return max(cands, key=lambda t: (t.category == "person", t.counted,
+                                         FOLLOW_WEIGHT.get(t.category, 1.0) * t.area * t.score))
+
+    def _steer(self, centre, vel, cfg, zoom: bool):
+        """Aim the PTZ where the target will be (eye coordinates), and zoom once pointed."""
+        sync, ptz = self.sync, self.ptz
+        now = time.monotonic()
+        u, v = float(centre[0]), float(centre[1])
+        vel = np.array(vel, float)
+        rate = cfg["pt_rate"] or PT_RATE
+        pose = ptz.pose_estimate()
+        jac = sync.jacobian(u, v)
+        fld = sync.field(u, v, ptz.zoom_pos if ptz.zoom_pos is not None else sync.ptz_zoom, cfg["zoom_curve"])
+        field_u = max(min(abs(fld[0] * jac[0, 0]), abs(fld[1] * jac[1, 1])), 1.0) if fld else 50.0
+        pan0, tilt0 = sync.ptz_raw(u, v)
+        gap = max(abs(pan0 + self._bias[0] - pose[0]), abs(tilt0 + self._bias[1] - pose[1])) if pose else float("inf")
+        swing = gap > self.ACQUIRE * field_u
+        # Aim where it will be when the camera gets there: the eye's lag plus the travel time. A walker is pursued
+        # at a speed that arrives in ARRIVE_S (smooth), a new target swung to at full speed.
+        arrive = min(gap / rate, 1.5) if swing else self.ARRIVE_S
+        lead = self.EYE_LAT_S + arrive
+        pu, pv = min(max(u + vel[0] * lead, 0.0), 1.0), min(max(v + vel[1] * lead, 0.0), 1.0)
+        raw_pan, raw_tilt = sync.ptz_raw(pu, pv)
+        raw_pan, raw_tilt = raw_pan + self._bias[0], raw_tilt + self._bias[1]
+        goal = sync.clamp(raw_pan, raw_tilt)  # never outside the calibrated area
+        self._aim_raw_tilt = raw_tilt
+        need = max(abs(goal[0] - pose[0]), abs(goal[1] - pose[1])) if pose else float("inf")
+        moved = max(abs(goal[0] - self._aim[0]), abs(goal[1] - self._aim[1])) if self._aim else float("inf")
+        if swing or (now - self._aim_t >= self.AIM_PERIOD_S and moved > self.AIM_DEADBAND * field_u):
+            speed = 1.0 if swing else min(1.0, max(1.0 / PAN_MAX, need / (rate * self.ARRIVE_S)))
+            if ptz.pan_tilt_to(goal[0], goal[1], speed):
+                self._aim, self._aim_t, self._aim_bias = goal, now, tuple(self._bias)
+        if pose is not None and ptz.zoom_pos is not None:
+            self._poses.append((now, pose[0], pose[1], ptz.zoom_pos, self._aim_bias))
+        if need / field_u <= self.POINTED:
+            self._pointed_since = self._pointed_since or now
+        else:
+            self._pointed_since = None
+        if zoom:
+            self._eye_zoom(u, v, jac, vel, now, cfg)
+
+    def _eye_zoom(self, u, v, jac, vel, now, cfg):
+        """One zoom step from the eye's measurement of the target's height, capped so it stays in frame."""
+        ptz, sync, curve = self.ptz, self.sync, cfg["zoom_curve"]
+        zp = ptz.zoom_pos
+        if zp is None or not self._eye_h or now - self._zoom_t < self.ZOOM_PERIOD_S or not ptz.zoom_arrived:
+            return
+        h = sorted(self._eye_h)[len(self._eye_h) // 2]
+        goal = sync.zoom_for(u, v, h, cfg["target_size"], curve, cfg["max_zoom_pos"])
+        fp = sync.footprint(u, v)
+        if goal is None or fp is None:
+            return
+        k_cal = mag_at(sync.ptz_zoom, curve)
+        fw_cal, fh_cal = abs(fp[0] * jac[0, 0]), abs(fp[1] * jac[1, 1])  # the field in pan/tilt units, calibration zoom
+        caps = []
+        drift = np.abs(jac @ vel) * (self.AIM_PERIOD_S + self.EYE_LAT_S)  # how far it moves before the next aim lands
+        for f_cal, d in ((fw_cal, drift[0]), (fh_cal, drift[1])):
+            if d > 1e-6:
+                caps.append(k_cal * f_cal * self.FIT / d)
+        lim = sync.tilt_limits
+        if lim and self._aim_raw_tilt is not None and self._aim_raw_tilt < lim[0]:
+            # Below the lowest tilt the PTZ cannot centre it: zoom only as far as it still fits in the frame.
+            caps.append(k_cal * fh_cal / (2.0 * ((lim[0] - self._aim_raw_tilt) + 0.55 * h * abs(jac[1, 1]))))
+        if caps:
+            goal = min(goal, pos_for(max(1.0, min(caps)), curve))
+        if goal > zp and (self._pointed_since is None or now - self._pointed_since < self.POINTED_FOR):
+            return  # zoom in only once pointed at it
+        if abs(goal - zp) >= 256:
+            ptz.zoom_to(goal)
+            self._zoom_t = now
+
+    def _eye_search(self, ts, lost_for, cfg):
+        if self.target_id is None:
+            return  # idle: where the last target left it, which is Home
+        t, slow = self._target, self.target_category in SLOW
+        if slow and lost_for <= self.COAST_S and t is not None:
+            c = (t.center[0] + t.vel[0] * lost_for, t.center[1] + t.vel[1] * lost_for)
+            self._steer(c, t.vel, cfg, zoom=False)  # behind a tree or a bar: keep pace with it
+            return
+        if not slow and lost_for > self.VEHICLE_GRACE:
+            self.log.info("lost %s #%s; returning home", self.target_category, self.target_id)
+            self.ptz.home()
+            self.reset_target()
+            return
+        if slow and lost_for > self.COAST_S and not self._widened:
+            self._widened = True
+            hz, zp = self.ptz.home_zoom, self.ptz.zoom_pos
+            if cfg["autozoom"] and hz is not None and zp is not None and zp > hz + 256:
+                self.ptz.zoom_to(hz)
+        if lost_for > cfg["return_home_seconds"]:
+            self.log.info("nothing to follow; returning home")
+            self.ptz.home()
+            self.reset_target()
+
+    def _ptz_view(self):
+        """Where the PTZ looks now in the eye's picture: (centre u, v, field width, height), or None."""
+        pose, zp = self.ptz.pose_estimate(), self.ptz.zoom_pos
+        if pose is None or zp is None:
+            return None
+        cu, cv = self.sync.to_eye(*pose)
+        fld = self.sync.field(cu, cv, zp, self.cfg.data["ptz"]["zoom_curve"])
+        return (cu, cv, fld[0], fld[1]) if fld else None
+
+    def _refine(self, tracks, ts):
+        """PTZ frame, eye mode: find the target in the PTZ's own picture. Its offset corrects the sync map's aim
+        (parallax, calibration error), and the PTZ track joins the target's event so the close-up becomes the
+        photo, without ever being counted again."""
+        if isinstance(self._ptz_pick, int):
+            self._map_ptz_pick(tracks, ts)
+        t = self._target
+        self.ptz_match_id = None
+        if t is None or not self.ptz_usable or self.target_id is None or not self.ptz.zoom_arrived:
+            return
+        then = self._pose_at(time.monotonic() - self.PTZ_LAG_S)  # the PTZ picture shows the pose this long ago
+        if then is None:
+            return
+        _, pan_then, tilt_then, zoom_then, bias_then = then
+        cu, cv = self.sync.to_eye(pan_then, tilt_then)
+        fld = self.sync.field(cu, cv, zoom_then, self.cfg.data["ptz"]["zoom_curve"])
+        if fld is None:
+            return
+        fw, fh = fld
+        lag = self.PTZ_LAG_S - self.EYE_LAT_S  # the PTZ picture is older than the eye's
+        eu, ev = t.center[0] - t.vel[0] * lag, t.center[1] - t.vel[1] * lag
+        x_exp, y_exp = 0.5 + (eu - cu) / fw, 0.5 + (ev - cv) / fh
+        h_exp = (t.box[3] - t.box[1]) / fh
+        cats = RIDER if t.category in RIDER else {t.category}
+        best = None
+        for p in tracks:
+            if not p.confirmed or p.last_ts != ts or p.category not in cats:
+                continue
+            if not 0.5 <= (p.box[3] - p.box[1]) / max(h_exp, 1e-3) <= 2.0:
+                continue
+            d = math.hypot(p.center[0] - x_exp, p.center[1] - y_exp)
+            if d < self.REFINE_RADIUS and (best is None or d < best[0]):
+                best = (d, p)
+        if best is None:
+            return
+        p = best[1]
+        self.ptz_match_id = p.id
+        if t.event_id is not None and p.event_id is None:
+            p.event_id, p.counted = t.event_id, True
+        jac = self.sync.jacobian(cu, cv)
+        corr = jac @ np.array([(p.center[0] - x_exp) * fw, (p.center[1] - y_exp) * fh])
+        home = self.sync.field(cu, cv, self.ptz.home_zoom or self.sync.ptz_zoom, self.cfg.data["ptz"]["zoom_curve"])
+        lim = self.BIAS_MAX * abs((home[0] if home else fw) * jac[0, 0])
+        # x_exp came from the pose the camera really had, so the offset seen is the sync map's own error there,
+        # whatever correction that aim carried: ease the correction towards it (adding it up instead winds up any
+        # small constant error, such as a latency a frame off, without limit).
+        for k in (0, 1):
+            want = min(lim, max(-lim, float(corr[k])))
+            self._bias[k] += self.BIAS_GAIN * (want - self._bias[k])
+
+    def _pose_at(self, t):
+        """The pose (and the correction it was aimed with) at monotonic time t, if the camera was not swinging fast
+        then (a fast swing blurs the PTZ picture and its timing is uncertain)."""
+        older = [p for p in self._poses if p[0] <= t]
+        if not older:
+            return None
+        p = older[-1]
+        if t - p[0] > 0.3 and (self._aim_t > p[0] or not self.ptz.pt_arrived):
+            return None  # an old sample is only still true if the camera has not been aimed since
+        before = [q for q in older if q[0] <= p[0] - 0.2]
+        if before:
+            q = before[-1]
+            fld = self.sync.field(*self.sync.to_eye(p[1], p[2]), p[3], self.cfg.data["ptz"]["zoom_curve"])
+            jac = self.sync.jacobian(*self.sync.to_eye(p[1], p[2]))
+            span = abs(fld[0] * jac[0, 0]) if fld else 50.0
+            if max(abs(p[1] - q[1]), abs(p[2] - q[2])) > 0.25 * span or p[3] != q[3]:
+                return None
+        return p
+
+    def _map_ptz_pick(self, tracks, ts):
+        """The user clicked a PTZ track while the eye leads: find where it is in the eye's picture."""
+        p = next((x for x in tracks if x.id == self._ptz_pick), None)
+        view = self._ptz_view()
+        if p is None or view is None:
+            self._ptz_pick = None
+            return
+        cu, cv, fw, fh = view
+        self._ptz_pick = (cu + (p.center[0] - 0.5) * fw, cv + (p.center[1] - 0.5) * fh, p.category)
+
+    def _take_ptz_pick(self, visible):
+        u, v, cat = self._ptz_pick
+        self._ptz_pick = None
+        cats = RIDER if cat in RIDER else {cat}
+        near = [t for t in visible if t.category in cats and math.dist(t.center, (u, v)) < 0.08]
+        if near:
+            t = min(near, key=lambda t: math.dist(t.center, (u, v)))
+            self._set_eye_target(t)
+            self.user_locked = True
+            self.log.info("following %s #%d (picked on the PTZ view)", t.label, t.id)
 
     def _drive(self, pan: float, tilt: float):
         key = (round(pan * PAN_MAX), round(tilt * TILT_MAX))

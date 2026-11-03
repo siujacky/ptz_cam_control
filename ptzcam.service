@@ -20,6 +20,9 @@ RuntimeDirectory=ptzcam
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
 ExecStart=/home/pi/ptz_cam/.venv/bin/python -m ptzcam --segment-dir /run/ptzcam
+# Stop signals the app only: it closes its own ffmpeg processes, which then finish their last recording segment.
+# (systemd's default also signals every ffmpeg, and a second signal makes ffmpeg drop the end of its files.)
+KillMode=mixed
 Restart=always
 RestartSec=5
 TimeoutStopSec=20

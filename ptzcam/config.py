@@ -42,6 +42,24 @@ DEFAULTS = {
         "name": "Front", "rtsp_url": "rtsp://192.168.1.87:554/1", "http_url": "http://192.168.1.87",
         "username": "admin", "password": "admin",
         "visca_host": "192.168.1.87", "visca_port": 5678, "visca_address": 1,
+        # The PTZ camera's own USB link, if connected: its anti-flicker (power_line_frequency) is put back to this
+        # whenever the camera reconnects, because a camera restart resets it. -1 = leave it, 0 off, 1 50 Hz, 2 60 Hz.
+        "usb_device": "", "anti_flicker": -1,
+    },
+    "eye": {  # a second, fixed USB camera beside the PTZ camera (see README, "Two cameras")
+        "enabled": False, "name": "Wide", "device": "Avaya HC020",
+        "width": 1920, "height": 1080, "fps": 15, "anti_flicker": -1,
+        "zone": [],      # counting zone on the eye's picture; empty = the PTZ Home view's area once synced
+        "count": True,   # count on the eye: a fixed view never pauses while the PTZ follows
+        "follow": True,  # the eye picks targets and aims the PTZ (needs data/sync.json, tools/calibrate_sync.py)
+        "clips": "auto",  # keep a wide clip per event: auto (only when the PTZ clip does not show the whole scene),
+                          # always, or never
+    },
+    "failover": {  # which camera the live view, photos and clips come from
+        "mode": "auto",        # auto: the PTZ, unless it is washed out or offline; or always "ptz" / "eye"
+        "white": 0.5,          # the PTZ counts as washed out with this share of its picture burnt white...
+        "switch_after": 20.0,  # ...for this long (seconds), or as soon as it is blinded or offline
+        "return_after": 120.0,  # and is main again once clear for this long
     },
     "detect": {
         "model": "models/yolov11m.hef", "fps": 15, "width": 1280, "height": 720,
@@ -67,6 +85,7 @@ DEFAULTS = {
         # The lens, measured by tools/calibrate_zoom.py: [[zoom position, magnification], ...] and the
         # zoom-direct speed in positions per second. Empty / 0 = not measured (an assumed model is used).
         "zoom_curve": [], "zoom_rate": 0.0,
+        "pt_rate": 0.0,  # absolute pan/tilt speed at full speed, units per second; 0 = an estimate
     },
     "lowlight": {  # night vision: Zero-DCE on the Hailo when the scene is dark (see lowlight.py)
         "mode": "auto", "model": "models/lowlight/zero_dce.hef", "detect": False, "save_clips": True,
@@ -86,13 +105,25 @@ DEFAULTS = {
 RESTART_KEYS = {
     ("camera", "rtsp_url"), ("detect", "model"), ("detect", "fps"), ("detect", "width"),
     ("detect", "height"), ("storage", "segment_dir"), ("storage", "segment_seconds"),
-    ("storage", "buffer_seconds"), ("lowlight", "model"),
+    ("storage", "buffer_seconds"), ("lowlight", "model"), ("eye", "enabled"), ("eye", "device"), ("eye", "width"),
+    ("eye", "height"), ("eye", "fps"),
 }
 LOWLIGHT_MODES = ("auto", "on", "off")
+FAILOVER_MODES = ("auto", "ptz", "eye")
+WIDE_CLIPS = ("auto", "always", "never")
 
 _NUM = {
     ("camera", "visca_port"): (int, 1, 65535),
     ("camera", "visca_address"): (int, 1, 7),
+    ("camera", "anti_flicker"): (int, -1, 2),
+    ("eye", "width"): (int, 320, 1920),  # 4K cannot be decoded in software on a Pi 5
+    ("eye", "height"): (int, 180, 1080),
+    ("eye", "fps"): (int, 5, 30),
+    ("eye", "anti_flicker"): (int, -1, 2),
+    ("failover", "white"): (float, 0.05, 1.0),
+    ("failover", "switch_after"): (float, 0.0, 3600.0),
+    ("failover", "return_after"): (float, 0.0, 86400.0),
+    ("ptz", "pt_rate"): (float, 0.0, 1e5),
     ("detect", "fps"): (int, 1, 30),
     ("detect", "width"): (int, 320, 1920),
     ("detect", "height"): (int, 180, 1080),
@@ -120,12 +151,14 @@ _NUM = {
     ("lowlight", "day_luma"): (float, 2.0, 250.0),
 }
 _BOOL = {("ptz", "enabled"), ("ptz", "autotrack"), ("ptz", "autozoom"), ("ptz", "autofocus"),
-         ("lowlight", "detect"), ("lowlight", "save_clips"), ("brightness", "auto"), ("brightness", "detect")}
+         ("lowlight", "detect"), ("lowlight", "save_clips"), ("brightness", "auto"), ("brightness", "detect"),
+         ("eye", "enabled"), ("eye", "count"), ("eye", "follow")}
 _STR = {
     ("camera", "name"), ("camera", "rtsp_url"), ("camera", "http_url"), ("camera", "username"),
-    ("camera", "password"), ("camera", "visca_host"), ("detect", "model"), ("storage", "data_dir"),
-    ("storage", "segment_dir"), ("web", "host"), ("web", "auth_user"), ("web", "auth_password"),
-    ("lowlight", "mode"), ("lowlight", "model"),
+    ("camera", "password"), ("camera", "visca_host"), ("camera", "usb_device"), ("detect", "model"),
+    ("storage", "data_dir"), ("storage", "segment_dir"), ("web", "host"), ("web", "auth_user"),
+    ("web", "auth_password"), ("lowlight", "mode"), ("lowlight", "model"), ("eye", "name"), ("eye", "device"),
+    ("eye", "clips"), ("failover", "mode"),
 }
 
 
@@ -162,6 +195,17 @@ def _strip_unknown(cfg, ref=DEFAULTS):
 
 def _is_num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _polygon(zone, name: str) -> list:
+    if not isinstance(zone, list) or len(zone) > 64 or 0 < len(zone) < 3:
+        raise ConfigError(f"{name} must be empty or a polygon of 3 to 64 points")
+    points = []
+    for p in zone:
+        if not (isinstance(p, (list, tuple)) and len(p) == 2 and all(_is_num(v) and 0 <= v <= 1 for v in p)):
+            raise ConfigError(f"{name} points must be [x, y] pairs between 0 and 1")
+        points.append([float(p[0]), float(p[1])])
+    return points
 
 
 def validate(cfg: dict, base_dir: Path, check_paths: bool = False) -> dict:
@@ -207,15 +251,14 @@ def validate(cfg: dict, base_dir: Path, check_paths: bool = False) -> dict:
             raise ConfigError(f"detect.categories.{name}.min_score must be between 0.05 and 0.99")
         c["min_score"] = float(c["min_score"])
 
-    zone = cfg["detect"]["zone"]
-    if not isinstance(zone, list) or len(zone) > 64 or 0 < len(zone) < 3:
-        raise ConfigError("detect.zone must be empty or a polygon of 3 to 64 points")
-    points = []
-    for p in zone:
-        if not (isinstance(p, (list, tuple)) and len(p) == 2 and all(_is_num(v) and 0 <= v <= 1 for v in p)):
-            raise ConfigError("detect.zone points must be [x, y] pairs between 0 and 1")
-        points.append([float(p[0]), float(p[1])])
-    cfg["detect"]["zone"] = points
+    for sec in ("detect", "eye"):
+        cfg[sec]["zone"] = _polygon(cfg[sec]["zone"], f"{sec}.zone")
+    if cfg["eye"]["clips"] not in WIDE_CLIPS:
+        raise ConfigError("eye.clips must be auto, always or never")
+    if cfg["failover"]["mode"] not in FAILOVER_MODES:
+        raise ConfigError("failover.mode must be auto, ptz or eye")
+    if cfg["eye"]["enabled"] and not cfg["eye"]["device"].strip():
+        raise ConfigError("eye.device must name the USB camera")
 
     hosts = cfg["web"]["allowed_hosts"]
     if not isinstance(hosts, list) or any(not isinstance(h, str) or not h.strip() for h in hosts):

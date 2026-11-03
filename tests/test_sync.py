@@ -101,6 +101,12 @@ class SyncTest(unittest.TestCase):
         lowest = min(m.to_ptz(u, 0.95)[1] for u in (0.2, 0.5, 0.8))
         self.assertGreaterEqual(lowest, -432)
 
+    def test_goals_are_clamped_to_the_calibrated_pan_range_too(self):
+        lo = min(self.m.samples[:, 2])
+        span = max(self.m.samples[:, 2]) - lo
+        pan, _ = self.m.clamp(lo - 10 * span, 0)
+        self.assertAlmostEqual(pan, lo - 0.1 * span, delta=1)
+
     def test_knows_where_it_was_calibrated(self):
         self.assertTrue(self.m.covers(0.5, 0.5))
         self.assertFalse(self.m.covers(0.02, 0.05))

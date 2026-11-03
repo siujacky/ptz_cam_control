@@ -135,3 +135,62 @@ def event_categories(row):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WideClipTests(unittest.TestCase):
+    """With an eye camera every event also asks for clip_wide.mp4; eye.clips "auto" keeps it only when the PTZ's
+    own clip does not show the whole scene."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.storage = Storage(root / "t.db")
+        self.rec, self.wide = FakeRecorder(), FakeRecorder()
+        self.cfg = FakeConfig()
+        self.media = root / "media"
+        self.events = EventManager(self.cfg, self.storage, self.rec, self.media, FakeBus(), wide_recorder=self.wide)
+        self.tracker = Tracker(16 / 9)
+        self.t = 1_800_000_000.0
+
+    def tearDown(self):
+        self.storage.close()
+        self.tmp.cleanup()
+
+    def count_one(self, camera="eye"):
+        for i in range(30):
+            self.t += 1 / FPS
+            tracks, removed = self.tracker.update([det(0.1 + 0.012 * i, 0.5)], self.t)
+            self.events.process(self.t, FRAME, tracks, removed, True, camera=camera)
+        eid, _, _, out, done = self.wide.jobs[-1]
+        out.write_bytes(b"x" * 20000)  # the clip builder made it
+        return eid, out, done
+
+    def test_auto_drops_the_wide_clip_when_the_ptz_stayed_home(self):
+        eid, out, done = self.count_one()
+        done(eid, True)
+        row = self.storage.get_event(eid)
+        self.assertIsNone(row["clip_wide_status"])
+        self.assertFalse(out.exists())
+        self.assertEqual(self.storage.get_event(eid)["main_camera"], "ptz")
+        self.assertEqual(self.storage._all("SELECT camera FROM tracks")[0]["camera"], "eye")
+
+    def test_auto_keeps_it_when_the_ptz_followed_or_the_eye_was_main(self):
+        eid, out, done = self.count_one()
+        self.events.wide_needed()  # the PTZ left Home during the event
+        done(eid, True)
+        self.assertEqual(self.storage.get_event(eid)["clip_wide_status"], "ready")
+        self.assertTrue(out.exists())
+
+    def test_always_and_never(self):
+        self.cfg.data["eye"]["clips"] = "always"
+        eid, out, done = self.count_one()
+        done(eid, True)
+        self.assertEqual(self.storage.get_event(eid)["clip_wide_status"], "ready")
+        self.cfg.data["eye"]["clips"] = "never"
+        jobs = len(self.wide.jobs)
+        self.t += 60  # a new event
+        for i in range(30):
+            self.t += 1 / FPS
+            tracks, removed = self.tracker.update([det(0.9 - 0.012 * i, 0.3)], self.t)
+            self.events.process(self.t, FRAME, tracks, removed, True, camera="eye")
+        self.assertEqual(len(self.wide.jobs), jobs)  # never asked for

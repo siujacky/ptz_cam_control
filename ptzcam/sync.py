@@ -82,13 +82,40 @@ class SyncMap:
         ok = np.isfinite(s[:, 4:6]).all(1)
         self._footprint = _Poly.fit(s[ok, 0], s[ok, 1], s[ok, 4:6], _degree_for(int(ok.sum()))) if ok.sum() >= 3 else None
         self._hull = _hull(s[:, 0:2])
+        span = float(np.ptp(s[:, 2]))
+        self._pan_range = (float(s[:, 2].min()) - 0.1 * span, float(s[:, 2].max()) + 0.1 * span)
 
     # ---- the three questions ----
     def to_ptz(self, u: float, v: float) -> tuple[int, int]:
-        pan, tilt = (float(x) for x in self._to_ptz(u, v))
+        return self.clamp(*self.ptz_raw(u, v))
+
+    def clamp(self, pan: float, tilt: float) -> tuple[int, int]:
+        """Keep a goal where the calibration went: the tilt the PTZ could reach, and the pan range it covered plus a
+        margin. A wrong map or a far-off prediction must never send the camera into the room."""
+        lo, hi = self._pan_range
+        pan = min(max(pan, lo), hi)
         if self.tilt_limits:
             tilt = min(max(tilt, self.tilt_limits[0]), self.tilt_limits[1])
         return round(pan), round(tilt)
+
+    def ptz_raw(self, u: float, v: float) -> tuple[float, float]:
+        """to_ptz without rounding or the tilt limit (for derivatives and for knowing how far out of reach)."""
+        pan, tilt = (float(x) for x in self._to_ptz(u, v))
+        return pan, tilt
+
+    def jacobian(self, u: float, v: float, d: float = 0.01) -> np.ndarray:
+        """[[dpan/du, dpan/dv], [dtilt/du, dtilt/dv]]: PTZ units per eye-frame unit at (u, v)."""
+        a = np.subtract(self.ptz_raw(u + d, v), self.ptz_raw(u - d, v))
+        b = np.subtract(self.ptz_raw(u, v + d), self.ptz_raw(u, v - d))
+        return np.stack([a, b], axis=1) / (2 * d)
+
+    def field(self, u: float, v: float, zoom: int, curve=None) -> tuple[float, float] | None:
+        """The PTZ picture's width and height in the eye's picture at (u, v) when zoomed to `zoom`."""
+        fp = self.footprint(u, v)
+        if fp is None:
+            return None
+        k = mag_at(self.ptz_zoom, curve or []) / mag_at(zoom, curve or [])
+        return fp[0] * k, fp[1] * k
 
     def to_eye(self, pan: float, tilt: float) -> tuple[float, float]:
         p = (np.array([pan, tilt], float) - self._pt_lo) / self._pt_span

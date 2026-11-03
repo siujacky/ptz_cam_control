@@ -70,6 +70,45 @@ This is a conference-room camera (ClearOne UNITE 200). In bright daylight its au
   .venv/bin/python tools/uvc_controls.py --camera unite set power_line_frequency=0   # off (1 = back to 50 Hz)
   ```
 
+## Two cameras (a wide camera beside the PTZ)
+
+A fixed USB wide camera (here an Avaya HC020, mounted beside the PTZ camera at the same window) can work with the PTZ camera. The app calls it the *eye*:
+
+- **It counts.** Its view never moves, so counting never pauses while the PTZ follows someone. It counts in your PTZ zone (or the PTZ's whole Home view) mapped into its picture, so the counted area stays the same.
+- **It steers the PTZ.** Once the two cameras are synced, the wide camera picks who to follow (people first). It points the PTZ straight at them with exact pan/tilt commands and zooms in one step from the size it measures. The PTZ's own picture then fine-tunes the aim. The PTZ no longer chases through its own picture, which lags half a second.
+- **It takes over when the PTZ is washed out.** When the sun blinds the PTZ (or it goes offline), the live view, the event photos and the default clips come from the wide camera. They switch back once the PTZ picture has been clear for 2 minutes. The live view says which camera is showing and why.
+- **Clips.** Every event keeps the PTZ's clip. With *Wide clips: auto*, the wide camera's clip is kept only when the PTZ followed someone during the event or the wide camera was the main camera. Otherwise it adds nothing and costs storage.
+
+**Setting it up**
+
+1. Connect the wide camera's USB cable to one of the Pi's blue USB 3 ports, and fit the Pi 5 Active Cooler first. A second video stream adds about a third of a CPU core, and the fanless Pi already runs near 80 °C.
+2. Check the Pi sees it: `.venv/bin/python tools/uvc_controls.py --camera avaya`.
+3. Settings → *Wide camera* → turn it on. The app restarts with both cameras.
+4. Sync the cameras once, **in daylight** (both must see the street clearly; at night their pictures cannot be matched). This takes about 3 minutes while the PTZ moves over a grid. It also measures the PTZ's zoom curve if that was never done.
+   ```bash
+   sudo systemctl stop ptzcam
+   .venv/bin/python tools/calibrate_sync.py
+   sudo systemctl start ptzcam
+   ```
+   Re-run it whenever either camera is moved or bumped. Until it has run, the wide camera still takes over when the PTZ is washed out, and the PTZ follows from its own picture as before.
+
+**Settings**
+
+| Setting | What it does |
+|---|---|
+| *Count on the wide camera* (`eye.count`) | Counting comes from the wide camera when it can (needs the sync, or a zone drawn on the wide picture) |
+| *Wide camera steers the PTZ* (`eye.follow`) | The wide camera picks targets and aims the PTZ (needs the sync) |
+| *Wide clips* (`eye.clips`) | `auto`, `always` or `never` |
+| *Anti-flicker* (`eye.anti_flicker`) | Put back on every reconnect. Off helps in sunshine (see *Bright daylight*) |
+| *Failover* (`failover.mode`) | `auto` (the PTZ unless it is washed out or offline), or always the PTZ / the wide camera |
+| *Washed out at* / *after* / *back after* | How white (50 %), for how long (20 s) before switching, and how long clear (120 s) before switching back |
+
+**Limits**
+
+- The wide camera's zoom is digital only (at most 1.8×). Detail on distant people still comes from the PTZ.
+- Only one program can use a USB camera's video at a time. The app holds it while the wide camera is on.
+- When the wide camera counts, the *direction* (left to right and so on) comes from its view.
+
 ## Night vision
 
 This camera has no infrared mode, so night vision is done in software, on the AI HAT:
@@ -89,8 +128,8 @@ What would help night footage more than any software:
 ## Camera notes
 
 - **Connections.** The app needs the camera's **network cable**: video and sound come over RTSP, and camera control over VISCA (TCP port 5678), with the camera's HTTP API as a fallback.
-  - The **USB cable** is only for the anti-flicker setting.
-  - USB can't replace the network. Its video is uncompressed and has no sound, and the Pi 5 has no hardware video encoder to record it. The Home preset and zoom positions also only come over the network.
+  - The PTZ camera's **USB cable** is only for its anti-flicker setting. Set `camera.usb_device` to `Unite 200` and `camera.anti_flicker` in `config.json`, and the app puts it back whenever the camera restarts.
+  - For this camera, USB can't replace the network. Its USB video is uncompressed and has no sound, and the Pi 5 has no hardware video encoder to record it. The Home preset and zoom positions also only come over the network. (The wide camera is different: it sends H.264 over USB, which the app records as it comes.)
 - **No infrared mode.** The camera rejects the IR-cut and day/night commands. Night vision is done in software (above). An IR illuminator will not help; white light will.
 - **Autofocus.** The camera does not support one-push autofocus. After each move the app sends *Focus Auto*, which also brings the lens back from manual focus.
 - Home is stored in camera preset **200**. Presets 1–9 are yours.
@@ -164,8 +203,9 @@ Tools that use the AI HAT or control the camera need the service stopped first. 
 |---|---|
 | `config.json` | Settings (also edited from the Settings page). Created on first run; not in the repository, as it holds passwords |
 | `data/ptzcam.db` | Events and counts (SQLite). `data/` is not in the repository |
-| `data/media/<day>/<event>/` | `snapshot.jpg`, `thumb.jpg`, `clip.mp4`, and `clip_night.mp4` for night events |
-| `/run/ptzcam/` | Rolling 2-minute video buffer, in RAM to protect the SD card (manual runs use `/dev/shm/ptzcam/`) |
+| `data/media/<day>/<event>/` | `snapshot.jpg`, `thumb.jpg`, `clip.mp4`, `clip_night.mp4` for night events, `clip_wide.mp4` from the wide camera |
+| `data/sync.json` | The two cameras' sync, measured by `tools/calibrate_sync.py` |
+| `/run/ptzcam/` | Rolling 2-minute video buffer, in RAM to protect the SD card (`eye/` holds the wide camera's; manual runs use `/dev/shm/ptzcam/`) |
 | `models/` | YOLO models for the Hailo-10H (`yolov11m` default, `yolov8m`). Downloaded (see *Installing*); not in the repository |
 | `models/lowlight/` | Night-vision models for the Hailo-10H (`zero_dce` default, `zero_dce_pp`), from the Hailo Model Zoo |
 | `tools/` | Calibration, evaluation and test tools (see *Development*) |
@@ -178,7 +218,8 @@ Retention: events older than 30 days are deleted automatically, and so are the o
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -t .                                    # unit tests (no hardware)
-.venv/bin/python tools/sim_autotrack.py [--calibrated]                                 # auto-follow against a simulated camera
+.venv/bin/python tools/sim_autotrack.py [--calibrated] [--eye]                         # auto-follow against a simulated camera (--eye: wide camera aims)
+.venv/bin/python tools/usbcam_smoke.py                                                 # the wide camera's capture, on the real camera (app's eye off)
 .venv/bin/python tools/eval_tracking.py VIDEO --out /tmp/eval                           # tracking/counting on a video
 .venv/bin/python tools/eval_lowlight.py CLIP... --out /tmp/eval --start 3 --duration 8  # detector input: raw vs night vision or auto brightness
 .venv/bin/python tools/mock_server.py --port 8090                                       # UI with fake data
@@ -232,6 +273,11 @@ Notes:
   sudo systemctl restart ptzcam
   ```
 - **Zoom calibration fails.** It needs a clear daytime picture with detail, and a camera that stays connected for about two minutes. It saves nothing when it fails, so just run it again later.
+- **Camera sync fails or the PTZ points beside the target.**
+  - The sync needs both cameras to see the street clearly, in daylight, through the same window.
+  - Re-run `tools/calibrate_sync.py` if either camera moved. The log line "sync map ignored" means `data/sync.json` was made for another wide camera.
+  - The PTZ's own picture corrects small errors as it follows, but not a moved camera.
+- **Wide camera offline.** Check `tools/uvc_controls.py --camera avaya` sees it, and that nothing else is using its video. The app retries by itself, and the PTZ carries on alone meanwhile.
 - **Detector offline after a kernel update.**
   - The Hailo driver is built by DKMS. Check that it exists for the running kernel:
     ```bash

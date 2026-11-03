@@ -153,7 +153,7 @@ All other COCO classes are ignored. The fine-grained label (car, truck, dog…) 
 - **Snapshot.** For every candidate track, the pipeline keeps the best frame, scored as score × √area, with a penalty if the box touches the frame edge.
   - On event creation it writes `snapshot.jpg` (1280×720 with boxes) and `thumb.jpg` (a 384×216 16:9 crop zoomed on the object).
   - If an attached object later produces a frame ≥ 20 % better, the snapshot is rewritten, at most once per 2 s, until the window closes.
-- **Clip.** `ClipBuilder` waits until the window end plus one segment plus a margin. It then selects the RAM segments overlapping the window and runs `ffmpeg -ss <offset> -f concat -i list -t <dur> -c copy -movflags +faststart clip.mp4`.
+- **Clip.** `ClipBuilder` waits until the window end plus one segment plus a margin. It then selects the RAM segments overlapping the window and runs `ffmpeg -f concat -i list -t <dur> -c copy -movflags +faststart clip.mp4` from the first segment's keyframe (no `-ss`: seeking into a segment and stream-copying dropped up to a GOP). A clip can therefore start up to one segment before the window; its lead is stored (`clip_lead`, `clip_wide_lead`) so the viewer keeps the same moment when switching versions.
   - The result is a browser-playable H.264/AAC MP4.
   - `clip_status` goes from `pending` to `ready` or `failed`, and the UI is told over SSE.
 - **Mapping segments to wall-clock time.** Segment files are `seg_<n>.ts`, where `n` starts at the epoch second when ffmpeg starts.
@@ -676,3 +676,52 @@ The lens must therefore be measured. At pan speed k = 1 the measured version lan
 - The camera's saved brightness was found at 0 (7 the day before), with `ldc` missing from `get_image_conf`. That is consistent with a Save on the camera's own image page. The live value was set back to 9.
 
 Lessons from the whole build are collected in `LESSONS_LEARNED.md`.
+
+## 22. Two cameras: the eye steers the PTZ (2026-11-02)
+
+**Goal (the user's).** The fixed USB wide camera (Avaya HC020) beside the PTZ camera is the "eye": it helps the PTZ, the two cameras are synced, and it becomes the main camera while the PTZ is washed out.
+
+**Measured first:**
+- **Avaya over UVC:**
+  - H.264 and MJPEG up to 3840×2160@30; YUYV up to 1080p.
+  - 1080p has the same field of view as 4K (scale 1.000).
+  - H.264 1080p15 has a fixed 30-frame GOP (keyframe every 2.0 s), and its 2 s segments decode on their own.
+  - Decoding 1080p15 to 1280×720 costs about 0.3 core; 4K decode is impossible.
+  - Digital zoom reaches at most 1.77×, centred, and reacts in about 0.4 s.
+  - Auto exposure only: manual exposure is refused with EINVAL.
+- **The Unite accepts absolute pan/tilt** (`81 01 06 02`, 4+4 nibbles). Home is pan 0, tilt −431, at the lower tilt limit of −432. 300 units take 1.7 s at speed 0x10.
+- **Hailo:**
+  - Separate bindings per thread: 36.6 fps from one thread, 70.4 from two, 52.5 together with Zero-DCE.
+  - `hailortcli run2`: yolov11m alone 70 fps; with zero_dce, 52 + 48 fps.
+
+**Design:**
+- **Per camera:** each camera is a `CameraUnit` (`pipeline.py`) running in its own thread, with its own frames, ring, tracker and picture state.
+- **Shared:** the detector (one lane per thread; it is only closed when no thread is inside it), the events, PTZ control, `AutoTracker` and `MainSelector` (`failover.py`).
+- **Eye capture** (`usbcam.py`): one ffmpeg reads the Avaya and writes two outputs, the ring at `/run/ptzcam/eye` and the frames. The recorder has a passive mode.
+- **Sync** (`sync.py`, `syncal.py`, `tools/calibrate_sync.py`, `data/sync.json`):
+  - A daylight sweep of absolute pan/tilt positions, matched with SIFT, CLAHE and a RANSAC homography.
+  - The fit is a polynomial for eye → pan/tilt and back, plus the PTZ's footprint in the eye.
+  - Pan and tilt are clamped to the calibrated range.
+- **Eye mode in `AutoTracker`** (`update_eye`):
+  - Targets come from eye tracks: people first, the eye's zone, and a slew limit taken from the map's Jacobian.
+  - The lead is the eye's lag (0.15 s) plus an arrival time of 0.6 s. Aims are re-sent every 0.4 s at a speed that arrives in 0.6 s (smooth pursuit); a new target is swung to at full speed.
+  - Zoom is one step from the eye's median box height, capped so the drift between aims stays within 0.3 of the field, and capped below the PTZ's lowest tilt.
+  - Refinement (`update` in eye mode) compares each PTZ detection with the pose the late picture shows (a pose history). The correction eases towards the measured map error, with a gain of 0.4 and at most half the Home field. The matched PTZ track joins the eye's event, so the close-up becomes the photo.
+  - It falls back to PTZ-only following when there is no map, the eye is offline or blinded, or VISCA is down.
+- **Counting:** the eye counts when it is enabled, online and not blinded, and has a zone or the sync. Its zone defaults to the PTZ zone or Home footprint mapped through the sync. On a handover, tracks already in view are marked counted. `tracks.camera` records which camera counted.
+- **Failover:**
+  - The PTZ blinded for 3 s, or ≥ 50 % white for 20 s, or offline, hands over to the eye if the eye is less white.
+  - It is clear again after 120 s below half the threshold.
+  - A switch is held for at least 30 s unless a camera goes offline.
+  - Main decides the live view (`?camera=`), the event photos (no photo from a washed-out picture), the default clip, and Zero-DCE.
+- **Clips:** `clip.mp4` stays the PTZ's. `clip_wide.mp4` comes from the eye ring; with `eye.clips` "auto" it is kept only when the PTZ was away from Home or the eye was main.
+
+**Simulation** (`tools/sim_autotrack.py --eye --calibrated`): 108 cases, with a physically late PTZ picture.
+
+| Mode | In frame | Worst overshoot | Zoom reversals (max) | Time to size, median |
+|---|---|---|---|---|
+| Eye mode | 100 % | 1.00× | 1 | 2.7 s |
+
+With a 1° map error, centring error was 0.01–0.02 of the frame with refinement, against 0.06–0.11 without.
+
+Lessons: LESSONS_LEARNED.md §7.

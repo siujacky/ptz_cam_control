@@ -44,9 +44,13 @@ CREATE INDEX IF NOT EXISTS idx_tracks_day ON tracks(day, category);
 """
 
 _EVENT_FIELDS = {"start_ts", "trigger_ts", "end_ts", "last_seen_ts", "top_category", "categories", "labels",
-                 "max_score", "snapshot", "thumb", "clip", "clip_status", "night", "clip_night", "clip_night_status"}
+                 "max_score", "snapshot", "thumb", "clip", "clip_status", "night", "clip_night", "clip_night_status",
+                 "clip_wide", "clip_wide_status", "main_camera", "clip_lead", "clip_wide_lead"}
 # Columns added after the first release, created on older databases at open.
-_EVENT_MIGRATIONS = (("night", "INTEGER NOT NULL DEFAULT 0"), ("clip_night", "TEXT"), ("clip_night_status", "TEXT"))
+_EVENT_MIGRATIONS = (("night", "INTEGER NOT NULL DEFAULT 0"), ("clip_night", "TEXT"), ("clip_night_status", "TEXT"),
+                     ("clip_wide", "TEXT"), ("clip_wide_status", "TEXT"), ("main_camera", "TEXT"),
+                     ("clip_lead", "REAL"), ("clip_wide_lead", "REAL"))
+_TRACK_MIGRATIONS = (("camera", "TEXT"),)  # which camera counted it: "ptz" or "eye"
 _TRACK_FIELDS = {"last_ts", "max_score", "direction", "label"}
 
 
@@ -95,6 +99,12 @@ def event_json(row: dict) -> dict:
         "night": bool(row["night"]),
         "clip_night_url": media(row["clip_night"]) if row["clip_night_status"] == "ready" else None,
         "clip_night_status": row["clip_night_status"],
+        "clip_wide_url": media(row["clip_wide"]) if row["clip_wide_status"] == "ready" else None,
+        "clip_wide_status": row["clip_wide_status"],
+        "main_camera": row["main_camera"] or "ptz",
+        # Seconds each camera clip starts before the event window (clips start on whole 2 s segments; the night
+        # clip starts on it): switching versions keeps the same moment with these.
+        "clip_lead": row["clip_lead"] or 0.0, "clip_wide_lead": row["clip_wide_lead"] or 0.0,
         "duration": round(row["end_ts"] - row["start_ts"], 1),
     }
 
@@ -112,6 +122,10 @@ class Storage:
             for col, decl in _EVENT_MIGRATIONS:
                 if col not in have:
                     self._db.execute(f"ALTER TABLE events ADD COLUMN {col} {decl}")
+            have = {r[1] for r in self._db.execute("PRAGMA table_info(tracks)")}
+            for col, decl in _TRACK_MIGRATIONS:
+                if col not in have:
+                    self._db.execute(f"ALTER TABLE tracks ADD COLUMN {col} {decl}")
 
     def close(self):
         with self._lock:
@@ -196,6 +210,9 @@ class Storage:
     def pending_clips(self) -> list[dict]:
         return self._all("SELECT * FROM events WHERE clip_status='pending' ORDER BY start_ts")
 
+    def pending_wide_clips(self) -> list[dict]:
+        return self._all("SELECT * FROM events WHERE clip_wide_status='pending' ORDER BY start_ts")
+
     def fail_pending_night_clips(self):
         """Night clips are built from frames held in RAM, so a restart loses any that were pending."""
         self._exec("UPDATE events SET clip_night_status='failed' WHERE clip_night_status='pending'")
@@ -208,12 +225,12 @@ class Storage:
 
     # ---- tracks ----
     def insert_track(self, event_id, track_id, category, label, first_ts, counted_ts, last_ts, max_score,
-                     direction) -> int:
+                     direction, camera=None) -> int:
         cur = self._exec(
             "INSERT INTO tracks(event_id, track_id, day, category, label, first_ts, counted_ts, last_ts, max_score,"
-            " direction) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " direction, camera) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (event_id, track_id, local_day(counted_ts), category, label, first_ts, counted_ts, last_ts,
-             max_score, direction))
+             max_score, direction, camera))
         return cur.lastrowid
 
     def update_track(self, tid: int, **fields):

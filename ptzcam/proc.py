@@ -5,6 +5,8 @@ import subprocess
 import threading
 import time
 
+_signal_lock = threading.Lock()
+
 
 def spawn(cmd, log, name, stdout=subprocess.DEVNULL):
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.PIPE, bufsize=0)
@@ -29,11 +31,20 @@ def _drain(stream, log, name):
 
 
 def terminate(proc, timeout=3.0):
+    """SIGTERM, then SIGKILL after `timeout`. Two threads may call this for one process: only the first sends
+    SIGTERM, because ffmpeg takes a second one as "exit now" and then drops the end of its output files."""
     if proc is None or proc.poll() is not None:
         return
-    proc.terminate()
+    with _signal_lock:
+        first = not getattr(proc, "sigterm_sent", False)
+        proc.sigterm_sent = True
+    if first:
+        proc.terminate()
     try:
         proc.wait(timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait(2)
+        try:
+            proc.wait(2)
+        except subprocess.TimeoutExpired:  # stuck in the kernel (a hung USB device): it dies with the device
+            pass

@@ -57,25 +57,32 @@ def point_in_polygon(x, y, poly) -> bool:
 
 
 class EventManager:
-    def __init__(self, cfg_store, storage, recorder, media_dir, bus, log=None, night_clipper=None):
+    def __init__(self, cfg_store, storage, recorder, media_dir, bus, log=None, night_clipper=None,
+                 wide_recorder=None):
         self.cfg = cfg_store
         self.storage = storage
-        self.recorder = recorder
+        self.recorder = recorder  # the PTZ camera's ring: clip.mp4
+        self.wide_recorder = wide_recorder  # the eye camera's ring, if there is one: clip_wide.mp4
         self.night_clipper = night_clipper
-        self.night = False  # night vision is on (set by the pipeline every frame)
+        self.night = False  # night vision is on (set by the pipeline every frame, from the main camera)
+        self.main = "ptz"  # which camera the live view and photos come from (set by the pipeline)
+        self._wide_needed = set()  # events whose PTZ clip does not show the whole scene (eye.clips "auto")
         self.media_dir = Path(media_dir)
         self.bus = bus
         self.log = log or logging.getLogger("ptzcam.events")
         self.active: ActiveEvent | None = None
         self._lock = threading.Lock()  # guards `active` against deletions from the web thread
 
-    def process(self, ts, frame, tracks, removed, counting_allowed: bool):
+    def process(self, ts, frame, tracks, removed, counting_allowed: bool, zone=None, usable: bool = True,
+                camera: str = "ptz"):
         """`frame` is what snapshots show (the night-vision view when that is on). `counting_allowed` also
-        means the zone is valid: the zone is drawn on the Home view, so image positions mean nothing while
-        the camera is away or moving."""
+        means the zone is valid: the PTZ zone is drawn on the Home view, so image positions mean nothing while
+        that camera is away or moving. With two cameras each calls this for its own tracks: `zone` is that
+        camera's zone (default detect.zone), and `usable` is false while its picture is washed out, so no
+        snapshot is taken from it."""
         cfg = self.cfg.data
         h, w = frame.shape[:2]
-        zone = cfg["detect"]["zone"]
+        zone = cfg["detect"]["zone"] if zone is None else zone
         visible = [t for t in tracks if t.confirmed and t.last_ts == ts]
         if zone and counting_allowed:
             for t in visible:
@@ -85,7 +92,7 @@ class EventManager:
         keep = max(float(cfg["events"]["preroll_seconds"]), 1.0)  # a best frame older than the pre-roll is stale
         with self._lock:
             a = self.active
-            for t in visible:
+            for t in visible if usable else ():
                 if t.counted and not (a and t.event_id == a.id):
                     continue
                 q = quality(t, w, h)
@@ -104,14 +111,15 @@ class EventManager:
                         continue
                     if zone and not t.in_zone:
                         continue
-                    self._count(t, ts, frame, cfg)
+                    self._count(t, ts, frame, cfg, camera)
 
             a = self.active
             if a is not None:
                 attached = [t for t in visible if t.event_id == a.id]
                 if attached:
                     a.last_seen = ts
-                self._maybe_improve_snapshot(a, attached)
+                if usable:
+                    self._maybe_improve_snapshot(a, attached)
                 if ts >= a.end:
                     self._close_active()
 
@@ -129,7 +137,7 @@ class EventManager:
                 self.active = None
 
     # ---- internals (called with the lock held) ----
-    def _count(self, t, ts, frame, cfg):
+    def _count(self, t, ts, frame, cfg, camera="ptz"):
         t.counted = True
         a = self.active
         new = a is None or ts >= a.end
@@ -143,7 +151,7 @@ class EventManager:
         a.max_score = max(a.max_score, t.max_score)
         a.last_seen = ts
         t.db_id = self.storage.insert_track(a.id, t.id, t.category, t.label, t.first_ts, ts, t.last_ts,
-                                            t.max_score, t.direction())
+                                            t.max_score, t.direction(), camera)
         top = min(a.categories, key=CATEGORY_PRIORITY.index)
         self.storage.update_event(a.id, top_category=top, categories=dict(a.categories), labels=dict(a.labels),
                                   max_score=round(a.max_score, 3), last_seen_ts=ts)
@@ -165,6 +173,11 @@ class EventManager:
         (self.media_dir / rel).mkdir(parents=True, exist_ok=True)
         self.storage.update_event(eid, snapshot=f"{rel}/snapshot.jpg", thumb=f"{rel}/thumb.jpg", clip=f"{rel}/clip.mp4")
         self.recorder.request_clip(eid, start, end, self.media_dir / rel / "clip.mp4", self._clip_done)
+        self.storage.update_event(eid, main_camera=self.main)
+        if self.wide_recorder is not None and cfg["eye"]["clips"] != "never":
+            self.storage.update_event(eid, clip_wide=f"{rel}/clip_wide.mp4", clip_wide_status="pending")
+            self.wide_recorder.request_clip(eid, start, end, self.media_dir / rel / "clip_wide.mp4",
+                                            self._wide_clip_done)
         if self.night:
             self.storage.update_event(eid, night=1)
             if self.night_clipper is not None and self.night_clipper.active:  # its frames are being kept
@@ -223,11 +236,32 @@ class EventManager:
                 fields["direction"] = t.direction()
             self.storage.update_track(t.db_id, **fields)
 
-    def _clip_done(self, eid: int, ok: bool):
+    def _clip_done(self, eid: int, ok: bool, lead: float = 0.0):
         """Called from the clip builder thread."""
-        self._media_done(eid, clip_status="ready" if ok else "failed")
+        self._media_done(eid, clip_status="ready" if ok else "failed", clip_lead=round(lead, 3))
 
-    def _night_clip_done(self, eid: int, ok: bool):
+    def wide_needed(self):
+        """The PTZ is away from its Home view or the eye is main: the open event's PTZ clip does not show the whole
+        scene, so (with eye.clips "auto") its wide clip is kept."""
+        with self._lock:
+            if self.active is not None:
+                self._wide_needed.add(self.active.id)
+
+    def _wide_clip_done(self, eid: int, ok: bool, lead: float = 0.0):
+        """Called from the eye ring's clip builder thread. With eye.clips "auto", a wide clip of an event the PTZ
+        filmed from its Home view the whole time adds nothing, so it is dropped to save storage."""
+        with self._lock:
+            needed = eid in self._wide_needed
+            self._wide_needed.discard(eid)
+        if ok and self.cfg.data["eye"]["clips"] == "auto" and not needed:
+            row = self.storage.get_event(eid)
+            if row is not None and row["clip_wide"]:
+                (self.media_dir / row["clip_wide"]).unlink(missing_ok=True)
+            self._media_done(eid, clip_wide=None, clip_wide_status=None)
+            return
+        self._media_done(eid, clip_wide_status="ready" if ok else "failed", clip_wide_lead=round(lead, 3))
+
+    def _night_clip_done(self, eid: int, ok: bool, lead: float = 0.0):
         """Called from the night clip thread."""
         self._media_done(eid, clip_night_status="ready" if ok else "failed")
 

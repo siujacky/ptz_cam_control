@@ -27,10 +27,8 @@ from ptzcam.camera import FrameSource  # noqa: E402
 from ptzcam.config import DEFAULTS, deep_merge, validate  # noqa: E402
 from ptzcam.ptz import ZOOM_ARRIVED, ViscaClient, _from_nibbles, _nibbles, _s16  # noqa: E402
 from ptzcam.syncal import calibrate_sync  # noqa: E402
+from ptzcam.uvc import controls, find_device, get, key  # noqa: E402
 from ptzcam.zoomcal import calibrate as calibrate_lens  # noqa: E402
-
-sys.path.insert(0, str(ROOT / "tools"))
-from uvc_controls import controls, find_device, get, key  # noqa: E402
 
 
 class Ptz:
@@ -93,7 +91,11 @@ def main():
 
     source = FrameSource(cam["rtsp_url"], 1920, 1080, 15)
     source.start()
-    dev = find_device(eye_cfg["device"])
+    try:
+        dev = find_device(eye_cfg["device"])
+    except LookupError as e:
+        source.stop()
+        sys.exit(f"eye camera not found: {e}")
     fd = os.open(dev, os.O_RDWR | os.O_NONBLOCK)
     try:  # the map only holds for the eye's current crop: record it, the app sets the same one
         ctrls = {key(c["name"]): c["id"] for c in controls(fd)}
