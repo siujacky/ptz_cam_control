@@ -14,10 +14,21 @@ Live tab or the page is hidden, the PTZ pad repeats moves while held and stops o
 click-to-follow sends the clicked track, a clip actually plays, focus stays in the viewer,
 Escape closes it, there is no horizontal scrolling at 360 px and every control has a name.
 
+With a wide camera (status.cameras.eye) it also checks: the big view streams camera=main and
+the picture-in-picture polls the other camera (and stops when hidden or off Live); tapping it
+swaps the cameras, the pick survives a reload and Auto undoes it; the Wide camera and Failover
+cards, the copyable calibration commands and the USB fields; and the zone editor drawing the
+wide camera's zone on its own frame. Against the mock (tools/mock_server.py) it also forces a
+failover (badge with the reason, no stream restart, "Too bright" only on the blinded camera),
+follows a wide-camera box (the PTZ line says the wide camera aims), switches the viewer between
+Close-up and Wide (default: the event's main camera, downloads follow, a pending wide clip),
+and turns the wide camera off and on again (Live and the zone editor as with one camera).
+
 State-changing checks only run against the mock unless --mutate yes is given. With it, a real
 backend sees a short PTZ move then Home, preset 3 called and preset 5 overwritten, auto-follow
-and auto-zoom toggled back, clip length changed and restored, and a test zone saved and then
-restored. Deleting an event and the SSE checks never run against a real backend.
+and auto-zoom toggled back, clip length changed and restored, eye.count toggled back, and test
+zones (PTZ and wide) saved and then restored. Deleting an event, the SSE and failover checks,
+restart keys and turning the wide camera off never run against a real backend.
 Exit status is non-zero if anything failed.
 """
 from __future__ import annotations
@@ -94,17 +105,32 @@ JS_SMALL_TARGETS = """() => {
 }"""
 
 JS_TRACK_POINT = """async () => {
-  const { state } = await import('/static/js/api.js');
-  const tracks = (state.tracks && state.tracks.tracks) || [];
-  const t = tracks.find((t) => (t.box[2] - t.box[0]) > 0.025 && (t.box[3] - t.box[1]) > 0.04 && t.box[1] > 0.12);
-  if (!t) return null;
+  // The boxes of the camera on the big view (with a wide camera, either one), not under a control. Import the
+  // module the page itself loaded: the real server serves it from /v/<build>/, and /static/ would be a fresh copy.
+  const app = document.querySelector('script[type="module"][src]');
+  const { tracksFor } = await import(new URL('api.js', app.src).href);
+  const tracks = tracksFor(document.getElementById('stage').dataset.camera || 'ptz');
   const img = document.getElementById('live-img');
   const r = img.getBoundingClientRect();
   const nw = img.naturalWidth || 16, nh = img.naturalHeight || 9;
   const s = Math.min(r.width / nw, r.height / nh);
   const w = nw * s, h = nh * s;
   const ox = r.left + (r.width - w) / 2, oy = r.top + (r.height - h) / 2;
-  return { id: t.id, x: ox + ((t.box[0] + t.box[2]) / 2) * w, y: oy + ((t.box[1] + t.box[3]) / 2) * h };
+  // The page follows the smallest box under the tap: pick a spot that no smaller box covers.
+  const area = (b) => (b[2] - b[0]) * (b[3] - b[1]);
+  const inside = (b, x, y, s = 0.012) => x >= b[0] - s && x <= b[2] + s && y >= b[1] - s && y <= b[3] + s;
+  for (const t of tracks) {
+    if (!((t.box[2] - t.box[0]) > 0.025 && (t.box[3] - t.box[1]) > 0.04 && t.box[1] > 0.12)) continue;
+    for (const [fx, fy] of [[0.5, 0.5], [0.5, 0.3], [0.5, 0.7], [0.3, 0.5], [0.7, 0.5]]) {
+      const nx = t.box[0] + fx * (t.box[2] - t.box[0]), ny = t.box[1] + fy * (t.box[3] - t.box[1]);
+      if (tracks.some((u) => u !== t && area(u.box) <= area(t.box) && inside(u.box, nx, ny))) continue;
+      const x = ox + nx * w, y = oy + ny * h;
+      const el = document.elementFromPoint(x, y);
+      if (!el || !el.closest('#stage') || el.closest('button, .stage-top .night-badge, .live-badge')) continue;
+      return { id: t.id, x, y };
+    }
+  }
+  return null;
 }"""
 
 
@@ -228,6 +254,61 @@ def mock_post(base: str, path: str, body: dict) -> dict:
         return json.load(r)
 
 
+def get_json(base: str, path: str) -> dict:
+    with urllib.request.urlopen(f"{base}{path}", timeout=10) as r:
+        return json.load(r)
+
+
+def put_config(base: str, patch: dict) -> dict:
+    req = urllib.request.Request(f"{base}/api/config", data=json.dumps(patch).encode(),
+                                 headers={"Content-Type": "application/json"}, method="PUT")
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def has_eye(base: str) -> bool:
+    return bool((get_json(base, "/api/status").get("cameras") or {}).get("eye"))
+
+
+def frame_gets(run, since: float, camera: str | None = None) -> list:
+    """frame.jpg requests (the picture-in-picture polls them), optionally of one camera."""
+    return [r for r in run.requests if r[0] >= since and r[1] == "GET" and "/api/frame.jpg" in r[2]
+            and (camera is None or f"camera={camera}&" in r[2])]
+
+
+JS_SRC = "(document.getElementById('live-img').getAttribute('src') || '')"
+
+
+def click_card(page, selector: str, last: bool = False) -> str | None:
+    """Click an event card and return its id. A live list update can rebuild the card between finding and
+    clicking it ("not attached to the DOM"), so look it up again and retry."""
+    for attempt in range(4):
+        loc = page.locator(selector)
+        card = loc.last if last else loc.first
+        try:
+            card.scroll_into_view_if_needed()
+            eid = card.get_attribute("data-id")
+            card.click()
+            return eid
+        except PWError as exc:
+            if "not attached" not in str(exc) or attempt == 3:
+                raise
+            page.wait_for_timeout(300)
+    return None
+
+
+def wait_event_settled(base: str, eid, timeout: float = 20.0):
+    """Wait until none of an event's clips is pending any more (each change rebuilds its card)."""
+    keys = ("clip_status", "clip_wide_status", "clip_night_status")
+    end = time.time() + timeout
+    while time.time() < end:
+        ev = get_json(base, f"/api/events/{eid}")
+        if all(ev.get(k) != "pending" for k in keys):
+            return ev
+        time.sleep(0.25)
+    raise AssertionError(f"event {eid} still has a pending clip after {timeout:.0f} s")
+
+
 def bodies(posts) -> list[dict]:
     return [json.loads(p[3]) if p[3] else {} for p in posts]
 
@@ -277,7 +358,8 @@ def tour(browser, base: str, out: Path, name: str, opts: dict, mutate: bool, is_
     if mutate:
         def ptz_hold():
             btn = page.locator('.dpad-btn[aria-label="Right"]')
-            btn.scroll_into_view_if_needed()
+            # Raw mouse presses land on whatever is on top: scroll the pad clear of the fixed phone tab bar.
+            btn.evaluate("(el) => el.scrollIntoView({ block: 'center' })")
             page.wait_for_function("!document.querySelector('.dpad-btn[aria-label=\"Right\"]').disabled")
             box = btn.bounding_box()
             t0 = time.time()
@@ -313,6 +395,7 @@ def tour(browser, base: str, out: Path, name: str, opts: dict, mutate: bool, is_
             run.check("arrow keys on the pad drive diagonals, then stop", any(b.get("pan") == 1 and b.get("tilt") == 1 for b in moves) and len(stops) == 1,
                       f"{len(moves)} moves {[(b.get('pan'), b.get('tilt')) for b in moves]}, {len(stops)} stop")
             zin = page.locator('.zoom-btn[data-zoom="in"]')
+            zin.evaluate("(el) => el.scrollIntoView({ block: 'center' })")
             box = zin.bounding_box()
             t0 = time.time()
             page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
@@ -399,11 +482,146 @@ def tour(browser, base: str, out: Path, name: str, opts: dict, mutate: bool, is_
         run.check("MJPEG paused while the viewer is open", paused)
     run.step("viewer pauses live", viewer_pauses_live, page)
 
+    # ---- Live with the wide camera ("eye"), when the server has one
+    def wide_live():
+        if not has_eye(base):
+            run.check("wide camera on Live", True, "skipped: no wide camera")
+            return
+        page.evaluate("window.scrollTo(0, 0)")
+        main = get_json(base, "/api/status")["main"]["camera"]
+        other = "ptz" if main == "eye" else "eye"
+        page.wait_for_selector("#pip:not([hidden])")
+        page.wait_for_function("document.getElementById('pip').classList.contains('has-frame')")
+        t0 = time.time()
+        page.wait_for_timeout(2000)
+        polls = frame_gets(run, t0, other)
+        big = page.evaluate(JS_SRC)
+        run.check("big view streams camera=main, the picture-in-picture polls the other camera",
+                  "camera=main" in big and len(polls) >= 2, f"{big}; {len(polls)} frames of the {other} camera in 2 s")
+        page.locator("#pip").click()
+        page.wait_for_function(f"{JS_SRC}.includes('camera={other}')")
+        page.wait_for_function("document.getElementById('live-img').naturalWidth > 0")
+        t1 = time.time()
+        page.wait_for_timeout(1200)
+        stored = page.evaluate("localStorage.getItem('ptzcam.liveCamera')")
+        swapped = bool(frame_gets(run, t1, main))
+        badge = page.locator("#cam-badge-text").inner_text() if page.locator("#cam-badge").is_visible() else ""
+        run.check("tapping the picture-in-picture swaps the cameras",
+                  swapped and page.locator("#btn-cam-auto").is_visible() and stored == json.dumps(other),
+                  f"stored {stored}, badge '{badge}', inset now shows the {main} camera: {swapped}")
+        if not desktop:
+            run.shot(page, "live-swapped")
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_function(f"{JS_SRC}.includes('camera={other}')")
+        page.wait_for_function("document.getElementById('live-img').naturalWidth > 0")
+        run.check("the picked camera is remembered after a reload", True, page.evaluate(JS_SRC))
+        page.locator("#btn-cam-auto").click()
+        page.wait_for_function(f"{JS_SRC}.includes('camera=main')")
+        run.check("Auto hands the big view back to the main camera",
+                  page.locator("#btn-cam-auto").is_hidden() and page.evaluate("localStorage.getItem('ptzcam.liveCamera')") == '"auto"')
+    run.step("wide camera live", wide_live, page)
+
+    if is_mock:
+        def failover():
+            if not has_eye(base):
+                run.check("failover", True, "skipped: no wide camera")
+                return
+            page.wait_for_function("document.getElementById('live-img').naturalWidth > 0")
+            src0 = page.evaluate(JS_SRC)
+            mock_post(base, "/_mock/state", {"ptz_blinded": True})
+            try:
+                wait_js(page, """() => !document.getElementById('cam-badge').hidden
+                    && document.getElementById('cam-badge-text').textContent.includes('washed out')
+                    && document.getElementById('stage').dataset.camera === 'eye'""", "the failover badge", timeout=6000)
+                page.wait_for_timeout(700)
+                src1 = page.evaluate(JS_SRC)
+                bright = page.locator("#bright-badge")
+                too_bright = bright.is_visible() and "Too bright" in bright.inner_text()
+                said = page.locator("#cam-announce").inner_text()
+                run.check("failover: announced from the always-present live region", "washed out" in said.lower(), said)
+                run.check("failover: the badge names the wide camera and why, and the open stream goes on",
+                          src1 == src0 and not too_bright,
+                          f"'{page.locator('#cam-badge-text').inner_text()}', stream {'unchanged' if src1 == src0 else 'restarted: ' + src1}, "
+                          f"'Too bright' on the wide view: {too_bright}")
+                run.shot(page, "live-failover")
+                page.locator("#pip").click()  # the blinded PTZ, picked for the big view, does get the badge
+                page.wait_for_function(f"{JS_SRC}.includes('camera=ptz')")
+                wait_js(page, """() => !document.getElementById('bright-badge').hidden
+                    && document.getElementById('bright-badge-text').textContent.startsWith('Too bright')""",
+                        "the blinded badge on the PTZ view", timeout=5000)
+                run.check("'Too bright: camera blinded' only for the blinded camera", True)
+                page.locator("#btn-cam-auto").click()
+                page.wait_for_function(f"{JS_SRC}.includes('camera=main')")
+            finally:
+                mock_post(base, "/_mock/state", {"ptz_blinded": False})
+            wait_js(page, "document.getElementById('cam-badge').hidden", "the badge to go once the PTZ is clear", timeout=6000)
+            said = page.locator("#cam-announce").inner_text()
+            run.check("failover: the way back is announced too", said == "PTZ camera on the big view", said)
+        run.step("failover", failover, page)
+
+    if mutate and is_mock:
+        def wide_follow():
+            st = get_json(base, "/api/status")
+            if not (st.get("cameras") or {}).get("eye") or st["ptz"].get("mode") != "eye":
+                run.check("click-to-follow on the wide camera", True, "skipped: the wide camera is not steering the PTZ")
+                return
+            page.locator("#stage").scroll_into_view_if_needed()
+            page.locator("#pip").click()
+            page.wait_for_function(f"{JS_SRC}.includes('camera=eye')")
+            page.wait_for_function("document.getElementById('live-img').naturalWidth > 0")
+            pt = None
+            for _ in range(40):
+                pt = page.evaluate(JS_TRACK_POINT)
+                if pt:
+                    break
+                page.wait_for_timeout(250)
+            try:
+                if not pt:
+                    run.check("click-to-follow on the wide camera", True, "skipped: no box in view")
+                    return
+                t0 = time.time()
+                page.mouse.click(pt["x"], pt["y"])
+                page.wait_for_timeout(600)
+                posts = run.posts(t0, "/api/ptz/autotrack")
+                body = json.loads(posts[0][3]) if posts else {}
+                run.check("click-to-follow on the wide camera sends the wide camera's track",
+                          body.get("track_id") == pt["id"] and pt["id"] >= 2 ** 40, f"clicked {pt['id']}, sent {body}")
+                wait_js(page, "document.getElementById('ptz-line-text').textContent.includes('aimed by the wide camera')",
+                        "the PTZ line to say the wide camera aims", timeout=5000)
+                run.check("the PTZ status line says the wide camera is aiming", True, page.locator("#ptz-line-text").inner_text())
+                page.locator("label.switch-row:has(#sw-follow)").click()
+                page.wait_for_timeout(400)
+            finally:
+                page.locator("#btn-cam-auto").click()
+                page.wait_for_function(f"{JS_SRC}.includes('camera=main')")
+        run.step("wide follow", wide_follow, page)
+
+    def pip_release():
+        if not has_eye(base):
+            return
+        fake_visibility(page, True)
+        page.wait_for_timeout(400)
+        t0 = time.time()
+        page.wait_for_timeout(1500)
+        hidden = len(frame_gets(run, t0))
+        fake_visibility(page, False)
+        t1 = time.time()
+        page.wait_for_timeout(1500)
+        after = len(frame_gets(run, t1))
+        run.check("the picture-in-picture stops polling while the page is hidden", hidden == 0 and after >= 1,
+                  f"{hidden} frames while hidden, {after} after")
+    run.step("pip visibility", pip_release, page)
+
     # ---- History
     def history():
         goto_tab(page, "history")
         released = page.evaluate("!document.getElementById('live-img').getAttribute('src')")
         run.check("MJPEG released when leaving Live", released)
+        if has_eye(base):
+            t0 = time.time()
+            page.wait_for_timeout(1200)
+            polls = frame_gets(run, t0)
+            run.check("picture-in-picture stops polling when leaving Live", not polls, f"{len(polls)} frames")
         page.wait_for_selector("#event-list .ev-card")
         page.wait_for_selector("#tl-bar .tl-mark")
         wait_images(page, "#event-list .ev-thumb img")
@@ -480,14 +698,104 @@ def tour(browser, base: str, out: Path, name: str, opts: dict, mutate: bool, is_
             page.wait_for_selector(f'#event-list .ev-card[data-id="{ev["id"]}"]', timeout=8000)
             same = page.evaluate("(id) => !!document.activeElement && document.activeElement.dataset.id === id", eid)
             run.check("keyboard focus survives a live list update", same, f"focused card {eid}, new event {ev['id']}")
+            wait_event_settled(base, ev["id"])  # its clip turning ready rebuilds its card: not during the next step
         run.step("keep focus", keep_focus, page)
+
+        def viewer_cameras():
+            if not has_eye(base):
+                run.check("viewer Close-up / Wide", True, "skipped: no wide camera")
+                return
+            video_src = "(document.getElementById('viewer-video').getAttribute('src') || '')"
+            mock_post(base, "/_mock/state", {"ptz_blinded": True})  # the wide camera is main when this event opens
+            try:
+                ev = mock_post(base, "/_mock/event", {"hold": 2, "wide_hold": 3})
+            finally:
+                mock_post(base, "/_mock/state", {"ptz_blinded": False})
+            sel = f'#event-list .ev-card[data-id="{ev["id"]}"]'
+            ev = wait_event_settled(base, ev["id"])
+            page.wait_for_selector(f"{sel}.is-ready", timeout=12000)
+            click_card(page, sel)
+            page.wait_for_selector("#viewer[open]")
+            wait_js(page, """() => !document.getElementById('vm-cam').hidden
+                && document.getElementById('vm-cam-eye').getAttribute('aria-pressed') === 'true'""",
+                    "the camera choice to start on the wide camera (main when the event opened)")
+            # At night the main camera's clip has a night-vision version, and it is the one shown first.
+            night = bool(ev.get("night"))
+            first = "/clip_night.mp4" if night else "/clip_wide.mp4"
+            wait_js(page, f"{video_src}.endsWith('{first}')", f"the wide camera's {'night-vision ' if night else ''}clip to play")
+            dl_wide = page.locator("#dl-mp4").get_attribute("download") or ""
+            night_on_main = page.locator("#vm-night").is_visible()
+            # Same moment in the other clip: each camera clip starts clip_lead / clip_wide_lead s before the event
+            # window, the night clip on it.
+            leads = get_json(base, f"/api/events/{ev['id']}")
+            lead_from = 0.0 if night else float(leads.get("clip_wide_lead") or 0)
+            page.evaluate("() => { const v = document.getElementById('viewer-video'); v.pause(); v.currentTime = 4; }")
+            wait_js(page, "Math.abs(document.getElementById('viewer-video').currentTime - 4) < 0.1", "the seek to 4 s")
+            page.locator("#vm-cam-ptz").click()
+            wait_js(page, f"{video_src}.endsWith('/clip.mp4')", "the close-up clip to play")
+            want = 4 - lead_from + float(leads.get("clip_lead") or 0)
+            wait_js(page, f"Math.abs(document.getElementById('viewer-video').currentTime - {want:.3f}) < 0.5",
+                    f"the close-up clip at the same moment ({want:.2f} s)", timeout=2000)
+            run.check("viewer: switching cameras keeps the same moment", True,
+                      f"lead {lead_from:.2f} s -> {float(leads.get('clip_lead') or 0):.2f} s, 4.00 s -> {want:.2f} s")
+            dl_ptz = page.locator("#dl-mp4").get_attribute("download") or ""
+            night_on_other = page.locator("#vm-night").is_visible()
+            run.check("viewer: Close-up / Wide starts on the event's main camera, the download follows",
+                      "-wide" in dl_wide and "-wide" not in dl_ptz, f"{dl_wide} -> {dl_ptz}")
+            if night:
+                run.check("viewer: night vision belongs to the main camera's clip", night_on_main and not night_on_other,
+                          f"toggle on Wide {night_on_main}, on Close-up {night_on_other}")
+            run.shot(page, "viewer-cameras")
+            page.keyboard.press("Escape")
+            page.wait_for_selector("#viewer:not([open])", state="attached")
+            clips0 = get_json(base, "/api/config")["eye"].get("clips", "auto")
+            try:
+                put_config(base, {"eye": {"clips": "always"}})  # keep this wide clip whatever the PTZ did
+                ev2 = mock_post(base, "/_mock/event", {"hold": 1.5, "wide_hold": 14})
+                sel2 = f'#event-list .ev-card[data-id="{ev2["id"]}"]'
+                page.wait_for_selector(f"{sel2}.is-ready", timeout=12000)
+                page.wait_for_timeout(1200)  # past the night clip (hold + 1 s) as well, if it is night
+                click_card(page, sel2)
+                page.wait_for_selector("#viewer[open]")
+                wait_js(page, "document.getElementById('vm-cam-ptz').getAttribute('aria-pressed') === 'true'", "the close-up first")
+                page.locator("#vm-cam-eye").click()
+                wait_js(page, """() => !document.getElementById('viewer-overlay').hidden
+                    && document.getElementById('viewer-overlay-text').textContent.startsWith('Processing wide clip')
+                    && document.getElementById('viewer-video').hidden""", "the processing notice for the pending wide clip")
+                run.check("viewer: a pending wide clip shows the processing notice and no download",
+                          page.locator("#dl-mp4").get_attribute("aria-disabled") == "true")
+                # The wide camera was not main, so no night-vision version applies to it.
+                wait_js(page, f"{video_src}.endsWith('/clip_wide.mp4')", "the wide clip to replace the notice once it is ready",
+                        timeout=20000)
+                run.check("viewer: the wide clip plays as soon as it is ready", True)
+                page.keyboard.press("Escape")
+                page.wait_for_selector("#viewer:not([open])", state="attached")
+                wait_event_settled(base, ev2["id"])
+                # eye.clips "auto": with the PTZ at Home the whole time, the wide clip adds nothing and is dropped.
+                put_config(base, {"eye": {"clips": "auto"}})
+                mock_post(base, "/api/ptz/home", {})
+                ev3 = mock_post(base, "/_mock/event", {"hold": 1.5, "wide_hold": 5})
+                sel3 = f'#event-list .ev-card[data-id="{ev3["id"]}"]'
+                page.wait_for_selector(f"{sel3}.is-ready", timeout=12000)
+                page.wait_for_timeout(1200)
+                click_card(page, sel3)
+                page.wait_for_selector("#viewer[open]")
+                wait_js(page, "!document.getElementById('vm-cam').hidden", "the camera choice while the wide clip is made")
+                wait_js(page, "document.getElementById('vm-cam').hidden", "the camera choice to go with the dropped wide clip",
+                        timeout=12000)
+                run.check("viewer: a wide clip dropped by eye.clips auto takes the camera choice with it",
+                          page.evaluate(f"{video_src}.endsWith('/clip.mp4') || {video_src}.endsWith('/clip_night.mp4')"))
+                page.keyboard.press("Escape")
+                page.wait_for_selector("#viewer:not([open])", state="attached")
+                wait_event_settled(base, ev3["id"])
+            finally:
+                put_config(base, {"eye": {"clips": clips0}})
+        run.step("viewer cameras", viewer_cameras, page)
 
     # ---- Viewer
     def viewer():
         page.evaluate("window.scrollTo(0, 0)")
-        card = page.locator("#event-list .ev-card.is-ready").first
-        card.scroll_into_view_if_needed()
-        card.click()
+        click_card(page, "#event-list .ev-card.is-ready")
         page.wait_for_selector("#viewer[open]")
         wait_js(page, """() => { const v = document.getElementById('viewer-video');
             return !v.hidden && v.readyState >= 2 && v.currentTime > 0.3; }""", "the clip to play", timeout=15000)
@@ -499,12 +807,16 @@ def tour(browser, base: str, out: Path, name: str, opts: dict, mutate: bool, is_
         run.check("MP4 download link", href.endswith(".mp4") and page.locator("#dl-mp4").get_attribute("download") is not None, href)
         page.wait_for_timeout(300)
         run.shot(page, "viewer")
-        title0 = page.locator("#viewer-sub").inner_text()
+        # Two events can start in the same second (the same line under the title): the n / N counter tells them apart.
+        where0 = [page.locator("#viewer-sub").inner_text(), page.locator("#viewer-count").inner_text()]
+        js_where = "[document.getElementById('viewer-sub').textContent, document.getElementById('viewer-count').textContent]"
         page.locator("#viewer-close").focus()
         page.keyboard.press("ArrowLeft")
-        wait_js(page, "(t) => document.getElementById('viewer-sub').textContent !== t", "ArrowLeft to show an older event", arg=title0)
+        wait_js(page, f"(w) => {{ const n = {js_where}; return n[0] !== w[0] || n[1] !== w[1]; }}",
+                "ArrowLeft to show an older event", arg=where0)
         page.keyboard.press("ArrowRight")
-        wait_js(page, "(t) => document.getElementById('viewer-sub').textContent === t", "ArrowRight to come back", arg=title0)
+        wait_js(page, f"(w) => {{ const n = {js_where}; return n[0] === w[0] && n[1] === w[1]; }}", "ArrowRight to come back",
+                arg=where0)
         run.check("arrow keys move between events", True)
         page.locator("#vm-snap").click()
         wait_js(page, "!document.getElementById('viewer-img').hidden && document.getElementById('viewer-img').complete", "the snapshot to show")
@@ -521,10 +833,7 @@ def tour(browser, base: str, out: Path, name: str, opts: dict, mutate: bool, is_
 
     if mutate and is_mock:  # deleting is destructive: only ever against the mock
         def delete_event():
-            card = page.locator("#event-list .ev-card").last
-            card.scroll_into_view_if_needed()
-            eid = card.get_attribute("data-id")
-            card.click()
+            eid = click_card(page, "#event-list .ev-card", last=True)
             page.wait_for_selector("#viewer[open]")
             page.locator("#viewer-delete").click()
             page.wait_for_selector("#confirm[open]")
@@ -612,6 +921,88 @@ def tour(browser, base: str, out: Path, name: str, opts: dict, mutate: bool, is_
         run.shot(page, "settings", full=True, max_height=4200)
     run.step("settings tab", settings, page)
 
+    def wide_settings():
+        eye = (get_json(base, "/api/status").get("cameras") or {}).get("eye")
+        card = page.locator(".s-eye")
+        if card.is_hidden():  # a server without wide camera settings shows Settings as before
+            cfg = get_json(base, "/api/config")
+            run.check("Wide camera and Failover cards hidden without wide camera settings",
+                      page.locator(".s-failover").is_hidden() and "eye" not in cfg)
+            if "usb_device" not in (cfg.get("camera") or {}):
+                run.check("no USB hint without the USB fields", page.locator("#usb-hint").is_hidden())
+            return
+        card.scroll_into_view_if_needed()
+        line = page.locator("#eye-status").inner_text()
+        sync = page.locator("#sync-status").inner_text()
+        cmd = page.locator("#sync-cmd").inner_text()
+        ok = "tools/calibrate_sync.py" in cmd and "systemctl stop ptzcam" in cmd and "systemctl start ptzcam" in cmd
+        ok = ok and (line.startswith(("Online", "No picture")) if eye else bool(line))
+        run.check("Wide camera card: live status, sync status, calibration commands", ok, f"{line} | {sync}")
+        page.locator("#sync-copy").click()
+        page.wait_for_selector(".toast", timeout=3000)
+        run.check("calibration commands can be copied", True, page.locator(".toast-msg").last.inner_text())
+        auto = page.locator("#sync-auto-cmd").inner_text()
+        run.check("the unattended sync command is offered",
+                  "systemd-run --unit=ptzcam-sync-once" in auto and "tools/sync_when_clear.py" in auto, auto)
+        n_toasts = page.locator(".toast-msg").count()
+        page.locator("#sync-auto-copy").click()
+        page.wait_for_function(f"document.querySelectorAll('.toast-msg').length > {n_toasts}", timeout=3000)
+        st = get_json(base, "/api/status")
+        if st.get("counting") != "eye" and st.get("counting_note"):
+            run.check("Wide camera card: why the wide camera does not count", st["counting_note"] in line, line)
+        if mutate and is_mock and eye:  # the sync only matters with the wide camera on
+            mock_post(base, "/_mock/state", {"sync_calibrated": False, "sync_scheduled": True})
+            try:
+                wait_js(page, """() => document.getElementById('sync-pill').textContent === 'Scheduled'
+                    && document.getElementById('sync-status').textContent.includes('automatic sync is waiting')""",
+                        "the scheduled sync", timeout=6000)
+                line2 = page.locator("#eye-status").inner_text()
+                run.check("a scheduled sync shows its progress, and why the PTZ counts meanwhile",
+                          "the PTZ camera counts: the wide camera needs the camera sync" in line2
+                          or bool(get_json(base, "/api/config").get("eye", {}).get("zone")),
+                          f"{page.locator('#sync-status').inner_text()} | {line2}")
+                run.shot(page, "settings-sync-scheduled", element=card)
+            finally:
+                mock_post(base, "/_mock/state", {"sync_calibrated": True, "sync_scheduled": False})
+            wait_js(page, "document.getElementById('sync-pill').textContent === 'Calibrated'", "the sync back", timeout=6000)
+        modes = page.evaluate("[...document.querySelectorAll('#f-fo-mode option')].map((o) => o.value)")
+        fo = page.locator("#failover-status").inner_text()
+        run.check("Failover card: mode, white share, switch and return times", modes == ["auto", "ptz", "eye"] and bool(fo)
+                  and page.locator("#f-fo-white").count() == 1 and page.locator("#f-fo-switch").count() == 1
+                  and page.locator("#f-fo-return").count() == 1, fo)
+        run.check("Camera card: USB name and anti-flicker", page.locator("#f-usb").count() == 1 and page.locator("#f-flicker").count() == 1)
+        clips = page.evaluate("[...document.querySelectorAll('#f-eye-clips option')].map((o) => o.value)")
+        run.check("Wide camera card: the wide clips choice", clips == ["auto", "always", "never"], str(clips))
+        run.shot(page, "settings-wide", element=card)
+        run.shot(page, "settings-failover", element=page.locator(".s-failover"))
+        if not mutate:
+            return
+        t0 = time.time()
+        row = page.locator("label.switch-row:has(#f-eye-count)")
+        row.click()
+        page.wait_for_selector("#savebar:not([hidden])")
+        page.locator("#settings-save").click()
+        page.wait_for_selector("#savebar", state="hidden")
+        row.click()
+        page.locator("#settings-save").click()
+        page.wait_for_selector("#savebar", state="hidden")
+        puts = bodies(run.posts(t0, "/api/config"))
+        run.check("a wide camera switch saves only {eye:{count}}",
+                  len(puts) == 2 and all(list(b) == ["eye"] and list(b["eye"]) == ["count"] for b in puts), str(puts))
+        if is_mock:  # restarts the pipeline: the mock only
+            page.locator(".s-eye details.advanced summary").click()
+            fps = page.locator("#f-eye-fps")
+            old = fps.input_value()
+            fps.fill("10" if old != "10" else "12")
+            page.locator("#settings-save").click()
+            page.wait_for_selector(".toast-msg:has-text('restarting')", timeout=6000)
+            page.wait_for_selector("#savebar", state="hidden")
+            fps.fill(old)
+            page.locator("#settings-save").click()
+            page.wait_for_selector("#savebar", state="hidden")
+            run.check("wide camera restart keys report the restart like the others", True)
+    run.step("wide camera settings", wide_settings, page)
+
     def night_ui():
         st = page.evaluate("fetch('/api/status').then(r => r.json())")
         active = bool((st.get("lowlight") or {}).get("active"))
@@ -682,6 +1073,67 @@ def tour(browser, base: str, out: Path, name: str, opts: dict, mutate: bool, is_
             page.locator("#zone-clear").click()
     run.step("zone editor", zone, page)
 
+    def wide_zone():
+        if page.locator("#zone-cams").is_hidden():
+            run.check("zone editor camera choice", True, "skipped: no wide camera configured")
+            return
+        zsrc = "(document.getElementById('zone-img').getAttribute('src') || '')"
+        page.locator("#zone-cams").scroll_into_view_if_needed()
+        run.check("the PTZ zone is drawn on the PTZ camera's frame", "camera=ptz" in page.evaluate(zsrc), page.evaluate(zsrc))
+        page.locator('#zone-cams button[data-cam="eye"]').click()
+        page.wait_for_function(f"{zsrc}.includes('camera=eye')")
+        page.wait_for_function("document.getElementById('zone-img').complete && document.getElementById('zone-img').naturalWidth > 0")
+        hint = page.locator("#zone-empty-hint").inner_text()
+        pill = page.locator("#zone-pill").inner_text()
+        run.check("wide camera zone: its own frame, and empty means automatic", "automatic" in hint.lower(), f"pill '{pill}': {hint}")
+        box = page.locator("#zone-stage").bounding_box()
+        for fx, fy in [(0.1, 0.72), (0.9, 0.7), (0.92, 0.97)]:
+            page.mouse.click(box["x"] + fx * box["width"], box["y"] + fy * box["height"])
+        run.shot(page, "zone-wide", element=page.locator(".zone-card"))
+        if mutate:
+            original = get_json(base, "/api/config").get("eye", {}).get("zone", [])
+            t0 = time.time()
+            page.locator("#zone-save").click()
+            page.wait_for_timeout(600)
+            puts = run.posts(t0, "/api/config")
+            body = json.loads(puts[0][3]) if puts else {}
+            run.check("wide zone saved as {eye:{zone}}", list(body) == ["eye"] and len(body["eye"].get("zone", [])) == 3,
+                      json.dumps(body)[:120])
+            put_config(base, {"eye": {"zone": original}})  # put the configured zone back
+        else:
+            page.locator("#zone-clear").click()
+        page.locator('#zone-cams button[data-cam="ptz"]').click()
+        page.wait_for_function(f"{zsrc}.includes('camera=ptz')")
+    run.step("wide zone", wide_zone, page)
+
+    if mutate and is_mock:
+        def no_eye():
+            if not has_eye(base):
+                return
+            goto_tab(page, "live")
+            page.locator("#pip").click()  # pick the wide camera: without one, the pick must not matter
+            page.wait_for_function(f"{JS_SRC}.includes('camera=eye')")
+            put_config(base, {"eye": {"enabled": False}})
+            try:
+                wait_js(page, "document.getElementById('pip').hidden", "the picture-in-picture to go", timeout=8000)
+                page.wait_for_function(f"{JS_SRC}.includes('camera=main')")
+                page.wait_for_function("document.getElementById('live-img').naturalWidth > 0")
+                run.check("without a wide camera Live is as before (no inset, no camera badge, a pick is ignored)",
+                          page.locator("#stage-cam").is_hidden() and page.locator("#pip").is_hidden(), page.evaluate(JS_SRC))
+                run.shot(page, "live-no-wide")
+                goto_tab(page, "settings")
+                wait_js(page, "document.getElementById('zone-cams').hidden", "the zone camera choice to go", timeout=8000)
+                run.check("without a wide camera the zone editor has no camera choice", True)
+            finally:
+                put_config(base, {"eye": {"enabled": True}})
+            goto_tab(page, "live")
+            wait_js(page, "!document.getElementById('pip').hidden", "the picture-in-picture to come back", timeout=8000)
+            page.wait_for_function(f"{JS_SRC}.includes('camera=eye')")  # the pick was kept for when it is back
+            page.locator("#btn-cam-auto").click()
+            page.wait_for_function(f"{JS_SRC}.includes('camera=main')")
+            run.check("the pick comes back with the wide camera", True)
+        run.step("no wide camera", no_eye, page)
+
     def a11y():
         for tab in ("live", "history", "stats", "settings"):
             goto_tab(page, tab)
@@ -698,7 +1150,7 @@ def tour(browser, base: str, out: Path, name: str, opts: dict, mutate: bool, is_
     return run
 
 
-def narrow(browser, base: str, out: Path) -> Run:
+def narrow(browser, base: str, out: Path, is_mock: bool = False) -> Run:
     """No horizontal scrolling at 360 px wide, on every tab and in the viewer."""
     run = Run("narrow360", out)
     ctx = browser.new_context(**NARROW, locale="en-US")
@@ -722,12 +1174,26 @@ def narrow(browser, base: str, out: Path) -> Run:
             if res:
                 run.shot(page, f"overflow-{tab}")
         goto_tab(page, "history")
-        page.locator("#event-list .ev-card").first.click()
+        click_card(page, "#event-list .ev-card")
         page.wait_for_selector("#viewer[open]")
         page.wait_for_timeout(400)
         over = page.evaluate("(() => { const d = document.querySelector('#viewer .viewer-side'); return d.scrollWidth - d.clientWidth; })()")
         run.check("no horizontal overflow in the viewer", over <= 0, f"{over}px")
         page.keyboard.press("Escape")
+        if is_mock and has_eye(base):  # the longest stage badge: the wide camera with its failover reason
+            goto_tab(page, "live")
+            mock_post(base, "/_mock/state", {"ptz_blinded": True})
+            try:
+                wait_js(page, "!document.getElementById('cam-badge').hidden", "the failover badge", timeout=6000)
+                page.wait_for_timeout(400)
+                res = page.evaluate(JS_OVERFLOW)
+                clipped = page.evaluate("""() => { const t = document.getElementById('cam-badge-text');
+                    return t.scrollWidth > t.clientWidth + 1; }""")
+                run.check("no horizontal scroll on live during failover", res is None,
+                          json.dumps(res) if res else f"badge text {'cut short' if clipped else 'fits'}")
+                run.shot(page, "live-failover")
+            finally:
+                mock_post(base, "/_mock/state", {"ptz_blinded": False})
     run.step("narrow layout", check_all, page)
     ctx.close()
     return run
@@ -768,7 +1234,7 @@ def main():
                 continue
             runs.append(tour(browser, base, out, name, opts, mutate, is_mock))
         if not args.only:
-            runs.append(narrow(browser, base, out))
+            runs.append(narrow(browser, base, out, is_mock))
         browser.close()
 
     print("\n== summary ==")

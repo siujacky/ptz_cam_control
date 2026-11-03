@@ -1,7 +1,8 @@
 // settings.js: Settings tab: config form (only changed fields are sent, as a partial
-// PUT /api/config), detection-zone editor and the live system panel.
+// PUT /api/config), detection-zone editor, the wide camera and failover cards and the
+// live system panel.
 import { api, bus, state } from './api.js';
-import { CATS, CAT_KEYS, h, icon, toast, fmtUptime, fmtNum, emptyState, errorState } from './ui.js';
+import { CATS, CAT_KEYS, CAM_NAME, h, icon, toast, fmtUptime, fmtNum, fmtTime, fmtDate, tsDay, today, capitalize, setText, emptyState, errorState } from './ui.js';
 import { createZoneEditor } from './zone.js';
 
 let els = {};
@@ -96,13 +97,16 @@ function syncOutput(el) {
 
 /* ------------------------------------------------------------------ dirty tracking, save */
 
+/** A setting this server's config does not have (an older backend): never shown, checked or sent. */
+const absent = (el) => base != null && getPath(base, el.dataset.path) === undefined;
+
 function collectPatch() {
   const cfg = base || {};
   const patch = {};
   let n = 0;
   for (const el of fields()) {
     const v = readField(el);
-    if (v === undefined) continue;
+    if (v === undefined || absent(el)) continue;
     if (!same(v, getPath(cfg, el.dataset.path), el.dataset.path)) {
       setPath(patch, el.dataset.path, v);
       n += 1;
@@ -118,6 +122,7 @@ function collectPatch() {
 
 function validate() {
   for (const el of fields()) {
+    if (absent(el)) continue;
     const v = readField(el);
     const label = els.form.querySelector(`label[for="${el.id}"]`)?.textContent || el.getAttribute('aria-label') || el.dataset.path;
     if (el.type === 'number') {
@@ -129,6 +134,8 @@ function validate() {
     if (el.dataset.path === 'camera.name' && !v) return { el, msg: 'Give the camera a name' };
     if (el.dataset.path === 'camera.rtsp_url' && !/^rtsps?:\/\//i.test(v)) return { el, msg: 'The stream URL should start with rtsp://' };
     if (el.dataset.path === 'camera.visca_host' && !v) return { el, msg: 'Enter the VISCA host' };
+    if (el.dataset.path === 'eye.name' && !v) return { el, msg: 'Give the wide camera a name' };
+    if (el.dataset.path === 'eye.device' && !v && els.eyeEnabled.checked) return { el, msg: "Enter the wide camera's USB name, e.g. Avaya HC020" };
   }
   const clip = readField(els.form.querySelector('[data-path="events.clip_seconds"]'));
   const pre = readField(els.form.querySelector('[data-path="events.preroll_seconds"]'));
@@ -165,6 +172,8 @@ async function save() {
     if (res?.config) {
       state.config = res.config;
       fill(res.config);
+      applyZones(res.config); // turning the wide camera on or off changes whose zone can be drawn
+      renderLive(state.status);
       bus.emit('config', res.config);
     }
     toast(res?.restarted ? 'Saved. Detection is restarting…' : 'Settings saved', { type: 'success' });
@@ -178,19 +187,29 @@ async function save() {
   }
 }
 
-async function saveZone(points) {
+/** Save one camera's zone: the PTZ Home view's (detect.zone) or the wide camera's (eye.zone). */
+async function saveZone(points, cam = 'ptz') {
+  const section = cam === 'eye' ? 'eye' : 'detect';
   try {
-    const res = await api.put('/api/config', { detect: { zone: points } });
+    const res = await api.put('/api/config', { [section]: { zone: points } });
     if (res?.config) {
       state.config = res.config;
       bus.emit('config', res.config);
     }
-    toast(points.length ? 'Detection zone saved' : 'Zone cleared: the whole frame is used', { type: 'success' });
-    return res?.config?.detect?.zone ?? points;
+    if (cam === 'eye') toast(points.length ? 'Wide camera zone saved' : 'Wide camera zone cleared: it is automatic again', { type: 'success' });
+    else toast(points.length ? 'Detection zone saved' : 'Zone cleared: the whole frame is used', { type: 'success' });
+    return res?.config?.[section]?.zone ?? points;
   } catch (err) {
     toast(`Couldn't save the zone: ${err.message}`, { type: 'error', timeout: 9000 });
     return null;
   }
+}
+
+/** Both zones and whether the wide camera's can be edited, from a config. */
+function applyZones(cfg) {
+  zone.setEyeEnabled(!!getPath(cfg, 'eye.enabled'));
+  zone.setSaved(getPath(cfg, 'detect.zone') || [], false, 'ptz');
+  zone.setSaved(getPath(cfg, 'eye.zone') || [], false, 'eye');
 }
 
 /* ------------------------------------------------------------------ fill */
@@ -198,7 +217,16 @@ async function saveZone(points) {
 function fill(cfg) {
   if (!cfg) return;
   base = cfg;
-  for (const el of fields()) writeField(el, getPath(cfg, el.dataset.path));
+  for (const el of fields()) {
+    const v = getPath(cfg, el.dataset.path);
+    writeField(el, v);
+    const holder = el.closest('.field, .switch-row, .range-field');
+    if (holder) holder.hidden = v === undefined;
+  }
+  // A server without the wide camera (an older backend) shows Settings as before.
+  els.eyeCard.hidden = cfg.eye === undefined;
+  els.failoverCard.hidden = cfg.failover === undefined;
+  els.usbHint.hidden = getPath(cfg, 'camera.usb_device') === undefined; // with its fields (an older backend)
   const cats = getPath(cfg, 'ptz.autotrack_categories') || [];
   for (const input of els.followCats.querySelectorAll('input')) input.checked = cats.includes(input.value);
   fillModels(cfg);
@@ -262,6 +290,7 @@ function renderNight(s) {
   }
   if (ll.active && Number.isFinite(Number(ll.enhance_ms))) parts.push(`${Math.round(ll.enhance_ms)} ms per frame on the AI HAT`);
   if (!ll.model && ll.mode !== 'off') parts.push('model not loaded');
+  if (s.main?.camera === 'eye' && s.cameras?.eye) parts.push('on the wide camera, main right now');
   els.nightStatus.textContent = parts.join(' · ');
 }
 
@@ -278,9 +307,150 @@ function renderBright(s) {
   els.brightPill.classList.toggle('is-warn', !!br.blinded);
   const parts = [];
   if (Number.isFinite(Number(br.white))) parts.push(`${Math.round(br.white)} % of the picture is pure white`);
+  if (br.camera === 'eye') parts.push('on the wide camera, main right now'); // these numbers follow the main camera
   if (br.blinded) parts.push('the camera is blinded by direct light: shade it');
   else if (on) parts.push(`stretched \u00d7${Number(br.gain).toFixed(1)}`);
   els.brightStatus.textContent = parts.join(' · ');
+}
+
+const setPill = (el, text, cls = '') => {
+  el.textContent = text;
+  el.className = `pill ${cls}`.trim();
+};
+
+const ago = (sec) => (sec < 120 ? `${Math.round(sec)} s` : `${Math.round(sec / 60)} min`);
+
+/** "Nov 1, 2026 at 3:12 PM" (or "today at ..."). */
+function whenText(ts) {
+  const day = tsDay(ts);
+  const date = day === today() ? 'today' : fmtDate(day, { month: 'short', day: 'numeric', year: 'numeric' });
+  return `${date} at ${fmtTime(ts)}`;
+}
+
+/** The Wide camera card's live line: online, fps, how white its picture is, whether it counts, which camera is main. */
+function renderEye(s) {
+  const eye = s?.cameras?.eye;
+  const parts = [];
+  if (eye && eye.online !== false) {
+    const isMain = s.main?.camera === 'eye';
+    setPill(els.eyePill, isMain ? 'Main camera' : 'Online', isMain ? 'is-accent' : 'is-good');
+    parts.push(`Online · ${fmtNum(eye.fps, 0)} fps`);
+    if (Number.isFinite(Number(eye.white))) parts.push(`${Math.round(eye.white)} % of the picture white`);
+    if (eye.blinded) parts.push('blinded by direct light');
+    // Why not, when it does not: off, offline or blinded, no sync or zone yet, or the PTZ's Home not read yet.
+    parts.push(s.counting === 'eye' ? 'counting passers-by'
+      : s.counting_note ? `the PTZ camera counts: ${s.counting_note}` : 'not counting (the PTZ camera counts)');
+    parts.push(isMain ? 'main camera now' : 'the PTZ camera is main');
+  } else if (eye) {
+    setPill(els.eyePill, 'Offline', 'is-bad');
+    const age = Number(eye.last_frame_age);
+    parts.push(Number.isFinite(age) && age > 2 ? `No picture for ${ago(age)}` : 'No picture yet');
+    parts.push('check the USB cable and the camera name');
+  } else if (getPath(base, 'eye.enabled')) {
+    setPill(els.eyePill, 'Starting');
+    parts.push('Waiting for the wide camera…');
+  } else {
+    setPill(els.eyePill, 'Off', 'is-muted');
+    parts.push('Off');
+  }
+  setText(els.eyeStatus, parts.join(' · '));
+}
+
+/** Camera sync: measured or not, when, and how well it aims. */
+function renderSync(s) {
+  const sync = s?.sync;
+  if (!sync) {
+    setPill(els.syncPill, '–');
+    setText(els.syncStatus, '');
+    return;
+  }
+  const auto = scheduledText(sync.scheduled);
+  if (!sync.calibrated) {
+    const waiting = sync.scheduled?.state === 'waiting' || sync.scheduled?.state === 'syncing';
+    setPill(els.syncPill, waiting ? 'Scheduled' : 'Not calibrated',
+      waiting ? 'is-accent' : getPath(base, 'eye.enabled') ? 'is-warn' : 'is-muted');
+    setText(els.syncStatus, `Not measured yet. Until it is, the wide camera counts only in its own zone and can't steer the PTZ.${auto ? ` ${auto}` : ''}`);
+    return;
+  }
+  setPill(els.syncPill, 'Calibrated', 'is-good');
+  const parts = [];
+  if (auto) parts.push(auto.replace(/\.$/, ''));
+  if (Number(sync.created) > 0) parts.push(`Last calibrated ${whenText(sync.created)}`);
+  if (Number(sync.positions) > 0) parts.push(`${sync.positions} positions`);
+  const r = sync.residuals || {};
+  if (Number.isFinite(Number(r.eye_median))) {
+    const worst = Number.isFinite(Number(r.eye_max)) ? ` (worst ${fmtNum(r.eye_max * 100, 1)} %)` : '';
+    parts.push(`aims within about ${fmtNum(r.eye_median * 100, 1)} % of the picture${worst}`);
+  }
+  setText(els.syncStatus, parts.join(' · '));
+}
+
+/** tools/sync_when_clear.py's progress (status.sync.scheduled), as a sentence; '' when it is not running. */
+function scheduledText(p) {
+  if (!p) return '';
+  if (p.state === 'waiting') {
+    const need = Math.round((Number(p.need) || 600) / 60);
+    const clear = Math.floor((Number(p.clear_for) || 0) / 60);
+    return clear > 0
+      ? `An automatic sync is waiting: both pictures clear for ${clear} of the ${need} minutes it needs.`
+      : `An automatic sync is waiting for both pictures to be clear for ${need} minutes in daylight.`;
+  }
+  if (p.state === 'syncing') return 'Syncing the cameras now.';
+  if (p.state === 'failed') return `The automatic sync did not finish: ${p.error || 'see its log'}.`;
+  return '';
+}
+
+/** Failover: which camera is main now, since when and why, and how white the PTZ picture is. */
+function renderFailover(s) {
+  const m = s?.main;
+  if (!s?.cameras?.eye || !m) {
+    setPill(els.failoverPill, 'Off', 'is-muted');
+    setText(els.failoverStatus, 'Needs the wide camera: turn it on in the Wide camera card.');
+    return;
+  }
+  const onEye = m.camera === 'eye';
+  // Amber only when failover put the wide camera there, not when it is set to always be main.
+  setPill(els.failoverPill, onEye ? 'Wide is main' : 'PTZ is main', !onEye ? 'is-good' : m.mode === 'eye' ? 'is-accent' : 'is-warn');
+  const since = Number(m.since) > 0 ? ` since ${fmtTime(m.since)}` : '';
+  const why = m.reason && m.reason !== 'PTZ camera' ? ` (${m.reason})` : '';
+  const parts = [`${CAM_NAME[onEye ? 'eye' : 'ptz']} is main${since}${why}`];
+  const ptz = s.cameras.ptz;
+  if (ptz?.online === false) parts.push('PTZ camera offline');
+  else if (ptz?.blinded) parts.push('PTZ picture blinded');
+  else if (Number.isFinite(Number(ptz?.white))) parts.push(`PTZ picture ${Math.round(ptz.white)} % white`);
+  setText(els.failoverStatus, capitalize(parts.join(' · ')));
+}
+
+/** Every status-driven line in the cards. */
+function renderLive(s) {
+  renderNight(s);
+  renderBright(s);
+  renderEye(s);
+  renderSync(s);
+  renderFailover(s);
+  zone.setCounting(s?.counting);
+}
+
+/** Copy the commands in `code`. Plain http on the LAN is not a secure context, so there is a fallback. */
+async function copyCommands(code) {
+  const text = code.textContent.trim();
+  let ok = false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    }
+  } catch { /* fall back below */ }
+  if (!ok) {
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range); // stays selected, so it can be copied by hand if the browser refuses
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
+  }
+  if (ok) toast('Copied. Paste the commands into a terminal on the Pi.', { type: 'success' });
+  else toast('Selected: copy the commands with your keyboard or the context menu');
 }
 
 async function load({ quiet = false } = {}) {
@@ -299,7 +469,8 @@ async function load({ quiet = false } = {}) {
     state.config = cfg;
     loaded = true;
     fill(cfg);
-    zone.setSaved(getPath(cfg, 'detect.zone') || []);
+    applyZones(cfg);
+    renderLive(state.status); // some lines depend on the config (is the wide camera on?)
     els.state.hidden = true;
     els.form.hidden = false;
     if (active) zone.activate();
@@ -335,19 +506,25 @@ function renderSystem(s) {
     h('dd', { class: cls }, value, extra || null),
   ];
   const num = (v, d = 1, unit = '') => (Number.isFinite(Number(v)) ? `${fmtNum(v, d)}${unit}` : '–');
+  // `camera` follows the main camera; with a wide camera each one gets its own rows.
+  const eye = s.cameras?.eye;
+  const ptzCam = eye ? { ...cam, ...(s.cameras.ptz || {}) } : cam;
+  const eyeRec = eye?.recorder || {};
   els.version.textContent = s.version ? `v${s.version}` : '';
   els.sys.replaceChildren(...[
     item('cpu', 'Model', `${det.model || '–'}${det.device ? ` · ${det.device}` : ''}`, null),
     item('stats', 'Inference', det.online === false ? 'Offline' : `${num(det.fps)} fps · ${num(det.infer_ms)} ms`, det.online === false ? null : null, det.online === false ? 'is-bad' : ''),
-    item('live', 'Camera', cam.online === false ? '' : `${cam.width || '–'}×${cam.height || '–'} · ${num(cam.fps)} fps `, flag(cam.online !== false)),
-    item('video', 'Recorder', rec.online === false ? '' : `${num(rec.buffer_seconds, 0)} s buffered `, flag(rec.online !== false)),
+    item('live', eye ? 'PTZ camera' : 'Camera', ptzCam.online === false ? '' : `${cam.width || '–'}×${cam.height || '–'} · ${num(ptzCam.fps)} fps `, flag(ptzCam.online !== false)),
+    eye ? item('wide', 'Wide camera', eye.online === false ? '' : `${num(eye.fps)} fps `, flag(eye.online !== false)) : null,
+    item('video', eye ? 'PTZ recorder' : 'Recorder', rec.online === false ? '' : `${num(rec.buffer_seconds, 0)} s buffered `, flag(rec.online !== false)),
+    eye ? item('video', 'Wide recorder', eyeRec.online === false ? '' : `${num(eyeRec.buffer_seconds, 0)} s buffered `, flag(eyeRec.online !== false)) : null,
     item('target', 'PTZ', ptz.enabled === false ? 'Disabled' : '', ptz.enabled === false ? null : flag(!!ptz.connected, 'Connected', 'Not connected')),
     item('thermo', 'CPU temperature', num(temp, 1, ' °C'), null, tempCls),
     item('cpu', 'CPU load', `${num(sys.cpu_percent, 0)}%${Array.isArray(sys.load) ? ` · load ${sys.load.map((x) => fmtNum(x, 2)).join(' ')}` : ''}`, null),
     item('disk', 'Disk free', num(sys.disk_free_gb, 1, ' GB'), null, Number(sys.disk_free_gb) < 5 ? 'is-warn' : ''),
     item('image', 'Media stored', num(sys.media_gb, 2, ' GB'), null),
     item('clock', 'Uptime', fmtUptime(s.uptime), null),
-  ].flat());
+  ].filter(Boolean).flat());
 }
 
 /* ------------------------------------------------------------------ build */
@@ -400,11 +577,27 @@ export function init() {
     nightStatus: document.getElementById('night-status'),
     brightPill: document.getElementById('bright-pill'),
     brightStatus: document.getElementById('bright-status'),
+    eyeCard: document.querySelector('.s-eye'),
+    failoverCard: document.querySelector('.s-failover'),
+    eyeEnabled: document.getElementById('f-eye-enabled'),
+    eyePill: document.getElementById('eye-pill'),
+    eyeStatus: document.getElementById('eye-status'),
+    syncPill: document.getElementById('sync-pill'),
+    syncStatus: document.getElementById('sync-status'),
+    syncCmd: document.getElementById('sync-cmd'),
+    syncCopy: document.getElementById('sync-copy'),
+    syncAutoCmd: document.getElementById('sync-auto-cmd'),
+    syncAutoCopy: document.getElementById('sync-auto-copy'),
+    usbHint: document.getElementById('usb-hint'),
+    failoverPill: document.getElementById('failover-pill'),
+    failoverStatus: document.getElementById('failover-status'),
     version: document.getElementById('sys-version'),
   };
   buildCategoryRows();
   buildFollowCats();
   zone = createZoneEditor({ onSave: saveZone });
+  els.syncCopy.addEventListener('click', () => copyCommands(els.syncCmd));
+  els.syncAutoCopy.addEventListener('click', () => copyCommands(els.syncAutoCmd));
 
   const onEdit = (e) => {
     const el = e.target;
@@ -438,14 +631,14 @@ export function init() {
 
   bus.on('status', (s) => {
     if (active || !loaded) renderSystem(s);
-    renderNight(s);
-    renderBright(s);
+    renderLive(s);
   });
+  bus.on('main', () => renderLive(state.status));
   bus.on('config', (cfg) => {
     if (!loaded || saving || cfg === base) return;
     // Another control (e.g. the Live auto-zoom switch) changed the config.
     mergeExternal(cfg);
-    zone.setSaved(getPath(cfg, 'detect.zone') || []);
+    applyZones(cfg);
   });
   window.addEventListener('beforeunload', (e) => {
     if (isDirty() || zone.isDirty()) {
@@ -454,15 +647,13 @@ export function init() {
     }
   });
   renderSystem(state.status);
-  renderNight(state.status);
-  renderBright(state.status);
+  renderLive(state.status);
 }
 
 export function show() {
   active = true;
   renderSystem(state.status);
-  renderNight(state.status);
-  renderBright(state.status);
+  renderLive(state.status);
   if (!loaded) load();
   else {
     if (!isDirty()) load({ quiet: true });

@@ -711,13 +711,14 @@ input[type="text"]:focus-visible, input[type="number"]:focus-visible, select:foc
   right: 0;
   z-index: 5;
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 6px;
   padding: 10px;
   background: linear-gradient(rgba(0, 0, 0, 0.5), transparent);
   pointer-events: none;
 }
-.stage-top > * { pointer-events: auto; }
+.stage-row, .stage-cam { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.stage-row > *, .stage-cam > * { pointer-events: auto; }
 .stage-spacer { flex: 1 1 auto; }
 
 .live-badge {
@@ -765,6 +766,122 @@ input[type="text"]:focus-visible, input[type="number"]:focus-visible, select:foc
 .bright-badge { background: rgba(90, 60, 10, 0.62); border-color: rgba(255, 210, 140, 0.3); color: #ffe2b0; }
 .bright-badge.is-blinded { background: rgba(120, 30, 20, 0.7); border-color: rgba(255, 170, 150, 0.35); color: #ffd6cc; }
 .night-badge .icon { width: 14px; height: 14px; }
+.cam-badge {
+  min-width: 0;
+  max-width: 100%;
+  background: rgba(8, 12, 20, 0.6);
+  border-color: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+}
+.cam-badge > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cam-badge.is-failover { background: rgba(90, 60, 10, 0.62); border-color: rgba(255, 210, 140, 0.3); color: #ffe2b0; }
+/* Auto: a 30 px pill like the badges, with a 44 px tall hit area. */
+.cam-auto {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  min-height: 44px;
+  margin: -7px 0;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--text);
+}
+.cam-auto-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px 0 10px;
+  border-radius: 999px;
+  background: rgba(8, 12, 20, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  font-size: 12px;
+  font-weight: 700;
+  transition: background 0.15s;
+}
+.cam-auto-pill .icon { width: 14px; height: 14px; }
+.cam-auto:hover .cam-auto-pill { background: rgba(8, 12, 20, 0.75); }
+.cam-auto:focus-visible { outline: none; }
+.cam-auto:focus-visible .cam-auto-pill { outline: 2px solid var(--accent-strong); outline-offset: 2px; }
+
+/* Picture-in-picture: the other camera, tap to swap. Above the offline message, so it stays reachable. */
+.pip {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 5;
+  display: block;
+  width: clamp(112px, 28%, 320px);
+  aspect-ratio: 16 / 9;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 10px;
+  background: #000;
+  color: #fff;
+  box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.85);
+  transition: border-color 0.15s, transform 0.15s;
+}
+.pip:hover { border-color: rgba(255, 255, 255, 0.5); }
+.pip:active { transform: scale(0.98); }
+.pip-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.pip.has-frame .pip-img { opacity: 1; }
+.pip:not(.has-frame)::before { /* waiting for the first frame of this camera */
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0 -8px;
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+.pip-label {
+  position: absolute;
+  left: 5px;
+  bottom: 5px;
+  max-width: calc(100% - 10px);
+  height: 20px;
+  padding: 0 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(8, 12, 20, 0.72);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pip.is-offline .pip-label { color: #ffb4b4; }
+.pip-swap {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(8, 12, 20, 0.6);
+}
+.pip-swap .icon { width: 13px; height: 13px; }
+.stage:has(.pip:not([hidden])) .stage-toast { bottom: calc(28% + 24px); } /* above the inset */
+.stage:fullscreen .pip, .stage.is-pseudo-fs .pip { right: max(12px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); }
 
 .stage-toast {
   position: absolute;
@@ -1569,7 +1686,9 @@ body.has-banner .hour-head { top: calc(var(--header-h) + env(safe-area-inset-top
 .s-rec { order: 5; }
 .s-follow { order: 6; }
 .s-cam { order: 7; }
-.s-sys { order: 8; }
+.s-eye { order: 8; }
+.s-failover { order: 9; }
+.s-sys { order: 10; }
 
 .cat-settings { display: flex; flex-direction: column; gap: 10px; }
 .cat-row {
@@ -1707,6 +1826,35 @@ body.has-banner .hour-head { top: calc(var(--header-h) + env(safe-area-inset-top
   pointer-events: none;
 }
 .zone-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.zone-cams button { flex: 1 1 0; justify-content: center; min-width: 0; padding: 0 10px; }
+@media (max-width: 399px) { .zone-cams .icon { display: none; } }
+
+/* Wide camera: sync status and the calibration commands */
+.sync-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+.sync-box .field-top .pill { margin-left: 0; }
+.cmd { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; }
+.cmd-text {
+  display: block;
+  align-self: stretch;
+  padding: 9px 11px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--text);
+  font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;    /* long commands wrap on a phone; copying takes the text, not the lines */
+  overflow-wrap: anywhere;
+  -webkit-user-select: all;
+  user-select: all;
+}
 
 /* System panel */
 .sys-grid {
@@ -1843,6 +1991,9 @@ body.has-banner .hour-head { top: calc(var(--header-h) + env(safe-area-inset-top
 .viewer-bar .seg { width: 100%; }
 .viewer-bar .seg button { flex: 1 1 0; justify-content: center; }
 .night-toggle { flex: 1 1 100%; justify-content: center; white-space: nowrap; }  /* own row: the side panel is narrow */
+/* Close-up / Wide shares a row with Night vision when both fit, else each takes its own. */
+.viewer-bar .cam-seg { width: auto; flex: 1 1 11rem; }
+.cam-seg:not([hidden]) ~ .night-toggle { flex: 1 1 8rem; }
 .night-toggle[hidden] { display: none; }
 .night-toggle[aria-pressed="true"] { background: rgba(70, 52, 150, 0.55); border-color: rgba(190, 170, 255, 0.4); color: #ece6ff; }
 .viewer-chips { display: flex; flex-wrap: wrap; gap: 6px; }

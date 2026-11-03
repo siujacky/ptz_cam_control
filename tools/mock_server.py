@@ -11,15 +11,28 @@ Implements every endpoint of ptz_camera_web.md section 9 with synthetic data:
   * MJPEG live view and single frames drawn over a real camera still, with 2-3
     mock objects drifting across it.  A small "digital PTZ" crops the still, so
     the pad, zoom, presets and auto-follow visibly do something;
-  * SSE: status every 2 s, tracks at 5 Hz, and every ~20 s a counts + event_new
+  * SSE: status every 2 s, tracks at 5 Hz per camera, and every ~20 s a counts + event_new
     whose clip turns ready via event_update ~5 s later;
-  * media (snapshots, thumbs and one ffmpeg-generated H.264+AAC clip) served from a
-    temp dir outside the project tree, with HTTP Range support.
+  * media (snapshots, thumbs and ffmpeg-generated H.264+AAC clips: the PTZ clip, a wide
+    clip and a night-vision clip, each visibly different) served from a temp dir outside
+    the project tree, with HTTP Range support.
+
+Two cameras, as in ptzcam/pipeline.py (start with --no-eye for a single-camera server):
+  * the "eye", a fixed wide camera, sees the whole still; the PTZ sees a crop of it. Both
+    serve ?camera=main|ptz|eye on /api/live.mjpg and /api/frame.jpg, and both publish
+    `tracks` ({camera, main}); the eye's track ids start at 2**40;
+  * failover: the main camera turns to the eye while the PTZ is washed out (ptz_blinded)
+    or offline, with an SSE `main` event; status has cameras, main, counting and sync;
+  * auto-follow is aimed by the eye (ptz.mode "eye") while it is synced and eye.follow is on;
+  * events carry clip_wide_url / clip_wide_status / main_camera (and the night clip fields).
 
 Mock-only helpers (not part of the real API):
   POST /_mock/state {"camera_online": false, "detector_online": true,
-                     "recorder_online": true, "ptz_connected": true}
-  POST /_mock/event {"hold": 60}   create an event now; clip stays pending `hold` s
+                     "recorder_online": true, "ptz_connected": true,
+                     "eye_online": true, "eye_recorder_online": true,
+                     "ptz_blinded": false, "sync_calibrated": true, "sync_scheduled": false}
+  POST /_mock/event {"hold": 60, "wide_hold": 90}   create an event now; its clip stays
+                     pending `hold` s and its wide clip `wide_hold` s (default hold + 2)
 """
 from __future__ import annotations
 
@@ -37,6 +50,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -56,16 +70,24 @@ CAT_HEX = {"person": "#4F9DFF", "vehicle": "#FFB020", "bicycle": "#2ED47A",
            "motorcycle": "#FF5C7A", "animal": "#B57BFF"}
 CAT_BGR = {k: (int(v[5:7], 16), int(v[3:5], 16), int(v[1:3], 16)) for k, v in CAT_HEX.items()}
 MODELS = ["models/yolov11m.hef", "models/yolov8m.hef"]
+LOWLIGHT_MODELS = ["models/lowlight/zero_dce.hef", "models/lowlight/zero_dce_pp.hef"]
 MASK = "********"
 VISCA_ZOOM_MAX = 16384
 LIVE_W, LIVE_FPS = 960, 12
 VIEW_BASE = 0.8          # fraction of the still visible at zoom 0 (room to pan)
 HOME = (0.5, 0.6)        # view centre at home: the street sits low in the still
+EYE_ID_BASE = 1 << 40  # track ids of the wide camera start here (ptzcam.ptz.EYE_ID_BASE)
+EYE_VIEW = (0.0, 0.0, 1.0)  # the eye is fixed and sees the whole still
+WIDE_DAYS = 2            # generated events this recent were recorded by the eye too
 
+# Mirrors ptzcam/config.py DEFAULTS (the UI's Settings form round-trips every key it shows).
 DEFAULT_CONFIG = {
     "camera": {"name": "Front", "rtsp_url": "rtsp://192.168.1.87:554/1", "http_url": "http://192.168.1.87",
                "username": "admin", "password": "admin", "visca_host": "192.168.1.87",
-               "visca_port": 5678, "visca_address": 1},
+               "visca_port": 5678, "visca_address": 1, "usb_device": "", "anti_flicker": -1},
+    "eye": {"enabled": True, "name": "Wide", "device": "Avaya HC020", "width": 1920, "height": 1080, "fps": 15,
+            "anti_flicker": -1, "zone": [], "count": True, "follow": True, "clips": "auto"},
+    "failover": {"mode": "auto", "white": 0.5, "switch_after": 20.0, "return_after": 120.0},
     "detect": {"model": "models/yolov11m.hef", "fps": 15, "width": 1280, "height": 720,
                "min_move": 0.5, "min_hits": 4, "zone": [],
                "categories": {"person": {"enabled": True, "min_score": 0.5},
@@ -80,11 +102,15 @@ DEFAULT_CONFIG = {
             "autotrack_categories": ["person", "vehicle", "bicycle", "motorcycle", "animal"],
             "deadzone": 0.12, "max_pan_speed": 12, "max_tilt_speed": 10, "return_home_seconds": 15,
             "home_preset": 0, "settle_seconds": 2.0, "autozoom": True, "target_size": 0.35,
-            "max_zoom_pos": 8192, "zoom_curve": [], "zoom_rate": 0.0},
+            "max_zoom_pos": 8192, "autofocus": True, "zoom_curve": [], "zoom_rate": 0.0, "pt_rate": 0.0},
+    "lowlight": {"mode": "auto", "model": "models/lowlight/zero_dce.hef", "detect": False, "save_clips": True,
+                 "night_luma": 45, "day_luma": 70},
+    "brightness": {"auto": True, "detect": True},
     "web": {"host": "0.0.0.0", "port": 8080, "live_width": 960, "live_fps": 12,
-            "auth_user": "", "auth_password": ""},
+            "auth_user": "", "auth_password": "", "allowed_hosts": []},
 }
-RESTART_KEYS = ["camera.rtsp_url", "detect.model", "detect.fps", "detect.width", "detect.height"]
+RESTART_KEYS = ["camera.rtsp_url", "detect.model", "detect.fps", "detect.width", "detect.height", "lowlight.model",
+                "eye.enabled", "eye.device", "eye.width", "eye.height", "eye.fps"]
 
 # Per-category geometry for mock objects, in normalized still coordinates:
 # (crossing time s, box width range, box h/w ratio, bottom-edge y range)
@@ -215,14 +241,17 @@ class Store:
         return group
 
     # ---- events
-    def new_event(self, trigger: float, status: str) -> dict:
+    def new_event(self, trigger: float, status: str, wide: str | None = None, main: str = "ptz",
+                  night: bool = False, night_status: str | None = None) -> dict:
+        """`wide`: the wide clip's status (None without an eye); `main`: the camera that was main."""
         ev_cfg = self.cfg()["events"]
         pre, clip = ev_cfg["preroll_seconds"], ev_cfg["clip_seconds"]
         eid = self._next_event
         self._next_event += 1
         ev = {"id": eid, "day": local_day(trigger), "start_ts": trigger - pre, "trigger_ts": trigger,
               "end_ts": trigger - pre + clip, "last_seen_ts": trigger, "rows": [],
-              "clip_status": status, "version": 0}
+              "clip_status": status, "clip_wide_status": wide, "main_camera": main,
+              "night": night, "clip_night_status": night_status if night else None, "version": 0}
         self.events[eid] = ev
         return ev
 
@@ -231,7 +260,7 @@ class Store:
         ev["rows"].append(t["track_id"])
         ev["last_seen_ts"] = min(ev["end_ts"], max(ev["last_seen_ts"], t["last_ts"]))
 
-    def generate(self, now: float, history_days: int, event_days: int):
+    def generate(self, now: float, history_days: int, event_days: int, wide_days: int = 0):
         rng = self.rng
         today = datetime.fromtimestamp(now).date()
         for back in range(history_days - 1, -1, -1):
@@ -249,12 +278,26 @@ class Store:
         self.tracks.sort(key=lambda t: t["counted_ts"])
         first_event_day = today - timedelta(days=event_days - 1)
         cutoff = datetime(first_event_day.year, first_event_day.month, first_event_day.day).timestamp()
+        first_wide_day = today - timedelta(days=wide_days - 1)
+        wide_cutoff = (datetime(first_wide_day.year, first_wide_day.month, first_wide_day.day).timestamp()
+                       if wide_days > 0 else math.inf)
         open_ev = None
         for t in self.tracks:
             if t["counted_ts"] < cutoff:
                 continue
             if open_ev is None or t["counted_ts"] > open_ev["end_ts"]:
-                open_ev = self.new_event(t["counted_ts"], "failed" if rng.random() < 0.05 else "ready")
+                ts = t["counted_ts"]
+                hour = datetime.fromtimestamp(ts).hour
+                night = hour < 6 or hour >= 21
+                wide = None
+                main = "ptz"
+                if ts >= wide_cutoff:  # the eye was installed: failover around midday sun, and wide clips
+                    main = "eye" if 10 <= hour < 15 and rng.random() < 0.3 else "ptz"
+                    # eye.clips "auto" keeps a wide clip only when it adds something (the PTZ was away, or failover)
+                    if main == "eye" or rng.random() < 0.45:
+                        wide = "failed" if rng.random() < 0.04 else "ready"
+                open_ev = self.new_event(ts, "failed" if rng.random() < 0.05 else "ready", wide=wide, main=main,
+                                         night=night, night_status="ready")
             self.attach(t, open_ev)
 
     def event_json(self, ev: dict) -> dict:
@@ -263,8 +306,10 @@ class Store:
         labels = Counter(r["label"] for r in rows)
         base = f"/media/{ev['day']}/{ev['id']}"
         ready = ev["clip_status"] == "ready"
+        wide = ev.get("clip_wide_status")
+        night = ev.get("clip_night_status")
         return {
-            "id": ev["id"], "start_ts": r3(ev["start_ts"]), "trigger_ts": r3(ev["trigger_ts"]),
+            "id": ev["id"], "day": ev["day"], "start_ts": r3(ev["start_ts"]), "trigger_ts": r3(ev["trigger_ts"]),
             "end_ts": r3(ev["end_ts"]), "last_seen_ts": r3(ev["last_seen_ts"]),
             "top_category": next(c for c in PRIORITY if c in cats),
             "categories": {c: cats[c] for c in CATEGORIES if c in cats},
@@ -273,6 +318,15 @@ class Store:
             "snapshot_url": base + "/snapshot.jpg", "thumb_url": base + "/thumb.jpg",
             "clip_url": base + "/clip.mp4" if ready else None,
             "clip_status": ev["clip_status"],
+            "night": bool(ev.get("night")),
+            "clip_night_url": base + "/clip_night.mp4" if night == "ready" else None,
+            "clip_night_status": night,
+            "clip_wide_url": base + "/clip_wide.mp4" if wide == "ready" else None,
+            "clip_wide_status": wide,
+            "main_camera": ev.get("main_camera") or "ptz",
+            # Seconds each camera clip starts before the event window (whole 2 s segments); night clips start on it.
+            "clip_lead": round((ev["id"] % 4) * 0.45, 3) if ready else 0.0,
+            "clip_wide_lead": round(((ev["id"] + 1) % 4) * 0.4, 3) if wide == "ready" else 0.0,
             "duration": round(ev["end_ts"] - ev["start_ts"], 1),
         }
 
@@ -483,21 +537,34 @@ class Renderer:
         cv2.rectangle(img, (x1 - th // 2, ty - tht - 5), (x1 + tw + 8, ty + base - 1), color, -1)
         cv2.putText(img, text, (x1 + 4, ty - 2), cv2.FONT_HERSHEY_SIMPLEX, fs, (23, 15, 11), 1, cv2.LINE_AA)
 
-    def osd(self, img, ts: float):
+    def osd(self, img, ts: float, name: str | None = None):
         text = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
         fs = img.shape[1] / 1500
         org = (int(img.shape[1] * 0.018), int(img.shape[0] * 0.06))
         cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, fs, (235, 235, 235), 1, cv2.LINE_AA)
-        name = self.cam_name()
+        name = name or self.cam_name()
         (tw, _), _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, fs, 1)
         org2 = (img.shape[1] - tw - org[0], img.shape[0] - org[0])
         cv2.putText(img, name, org2, cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(img, name, org2, cv2.FONT_HERSHEY_SIMPLEX, fs, (235, 235, 235), 1, cv2.LINE_AA)
 
+    @staticmethod
+    def offline(out_w: int, quality: int = 75) -> bytes:
+        """What the real server sends for a camera without fresh frames (ptzcam.draw.offline_frame)."""
+        out_h = int(round(out_w * 9 / 16 / 2) * 2)
+        img = np.full((out_h, out_w, 3), 24, np.uint8)
+        text, fs = "Camera offline", max(0.6, out_w / 960)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, 2)
+        cv2.putText(img, text, ((out_w - tw) // 2, (out_h + th) // 2), cv2.FONT_HERSHEY_SIMPLEX, fs, (170, 170, 170), 2,
+                    cv2.LINE_AA)
+        return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])[1].tobytes()
+
     def render(self, view: tuple, objs: list, overlay: bool, ts: float, out_w: int,
-               osd: bool = True, quality: int = 78) -> bytes:
-        """objs: [(id, cat, label, score, world_box, target, ltr)]"""
+               osd: bool = True, quality: int = 78, name: str | None = None, rect: tuple | None = None,
+               washout: bool = False) -> bytes:
+        """objs: [(id, cat, label, score, world_box, target, ltr)]; `rect`: the PTZ's view (x0, y0, size) in the
+        still, outlined on the wide camera's picture; `washout`: sun on the window, nearly all white."""
         x0, y0, vs = view
         px0, py0 = int(round(x0 * self.W)), int(round(y0 * self.H))
         pw, ph = max(16, int(round(vs * self.W))), max(9, int(round(vs * self.H)))
@@ -514,11 +581,20 @@ class Renderer:
             self.silhouette(img, cat, pb, oid, ltr)
             placed.append((cat, label, score, pb, target))
         img = self.light(img, ts)
+        if washout:
+            img = cv2.addWeighted(img, 0.18, np.full_like(img, 250), 0.82, 0)
         if overlay:
             for cat, label, score, pb, target in placed:
                 self.draw_box(img, cat, label, score, pb, target)
+            if rect is not None:
+                rx0, ry0, rs = rect
+                p0 = (int((rx0 - x0) / vs * out_w), int((ry0 - y0) / vs * out_h))
+                p1 = (int((rx0 + rs - x0) / vs * out_w), int((ry0 + rs - y0) / vs * out_h))
+                cv2.rectangle(img, p0, p1, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(img, "PTZ", (p0[0] + 6, max(p0[1] + 20, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (255, 255, 255), 2, cv2.LINE_AA)
         if osd:
-            self.osd(img, ts)
+            self.osd(img, ts, name)
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
         return buf.tobytes()
 
@@ -579,20 +655,25 @@ class Mock:
         self.rng = random.Random(args.seed)
         self.started = time.time()
         self.config = copy.deepcopy(DEFAULT_CONFIG)
+        self.config["eye"]["enabled"] = not args.no_eye
         self.flags = {"camera_online": True, "detector_online": True, "recorder_online": True,
-                      "ptz_connected": True}
+                      "ptz_connected": True, "eye_online": True, "eye_recorder_online": True,
+                      "ptz_blinded": False, "sync_calibrated": True, "sync_scheduled": False}
         self.store = Store(self.rng, lambda: self.config)
-        self.store.generate(self.started, history_days=60, event_days=args.days)
+        self.store.generate(self.started, history_days=60, event_days=args.days,
+                            wide_days=0 if args.no_eye else WIDE_DAYS)
         self.hub = Hub()
         self.ptz = PTZ()
         self.actors: list[Actor] = []
         self._next_actor = 100
         self._next_spawn = 0.0
+        self.main, self.main_reason, self.main_since = "ptz", "PTZ camera", 0.0
+        self.sync_created = self.started - 2 * 86400 - 3600 * 5
         self.tmp = Path(tempfile.mkdtemp(prefix="ptzcam-mock-"))
-        self.clip_path: Path | None = None
+        self.clips: dict[str, Path] = {}
         self.media_cache: dict[tuple, bytes] = {}
-        self.frame_cache: dict[bool, tuple] = {}
-        self.frame_locks = {True: asyncio.Lock(), False: asyncio.Lock()}
+        self.frame_cache: dict[tuple, tuple] = {}
+        self.frame_locks: dict[tuple, asyncio.Lock] = {}
         still = cv2.imread(str(args.still)) if args.still else None
         if still is None:
             if args.still:
@@ -606,19 +687,34 @@ class Mock:
 
     # ---- media
     def make_clip(self):
-        out = self.tmp / "clip.mp4"
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-               "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30",
-               "-f", "lavfi", "-i", "sine=frequency=440:beep_factor=4:sample_rate=48000",
-               "-t", "10", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
-               "-g", "30", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-movflags", "+faststart", str(out)]
-        t0 = time.time()
-        try:
+        """Three test clips made in parallel, each visibly different so switching between them shows: the PTZ
+        clip (clip.mp4), the wide camera's (clip_wide.mp4) and the night-vision one (clip_night.mp4)."""
+        sources = {"clip.mp4": ("testsrc2=size=1280x720:rate=30", None),
+                   "clip_wide.mp4": ("testsrc=size=1280x720:rate=30", None),
+                   "clip_night.mp4": ("testsrc2=size=1280x720:rate=30", "hue=s=0,eq=brightness=0.05:contrast=1.2")}
+
+        def make(name, src, vf):
+            out = self.tmp / name
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", src,
+                   "-f", "lavfi", "-i", "sine=frequency=440:beep_factor=4:sample_rate=48000",
+                   *(["-vf", vf] if vf else []),
+                   "-t", "10", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-pix_fmt", "yuv420p",
+                   "-g", "30", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-movflags", "+faststart", str(out)]
             subprocess.run(cmd, check=True, timeout=180)
-            self.clip_path = out
-            log.info("clip generated in %.1fs: %s (%d KB)", time.time() - t0, out, out.stat().st_size // 1024)
-        except (OSError, subprocess.SubprocessError) as exc:
-            log.error("ffmpeg clip generation failed (%s); ready clips will 404", exc)
+            return name, out
+
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(make, name, src, vf) for name, (src, vf) in sources.items()]
+            for f in futures:
+                try:
+                    name, out = f.result()
+                    self.clips[name] = out
+                except (OSError, subprocess.SubprocessError) as exc:
+                    log.error("ffmpeg clip generation failed (%s); those clips will 404", exc)
+        if self.clips:
+            log.info("clips generated in %.1fs: %s", time.time() - t0,
+                     ", ".join(f"{n} ({p.stat().st_size // 1024} KB)" for n, p in self.clips.items()))
 
     def event_media(self, ev: dict, name: str) -> bytes:
         key = (ev["id"], name, ev["version"])
@@ -643,6 +739,96 @@ class Mock:
         self.media_cache[key] = data
         return data
 
+    # ---- cameras
+    def eye_enabled(self) -> bool:
+        return bool(self.config["eye"]["enabled"])
+
+    def cam_online(self, cam: str) -> bool:
+        if cam == "eye":
+            return self.eye_enabled() and self.flags["eye_online"]
+        return self.flags["camera_online"]
+
+    def synced(self) -> bool:
+        return self.eye_enabled() and self.flags["sync_calibrated"]
+
+    def resolve(self, cam: str) -> str:
+        """?camera=main follows the main camera (a failover switches an open stream seamlessly)."""
+        return self.main if cam == "main" else cam
+
+    def ptz_mode(self) -> str:
+        """"eye" while the wide camera picks targets and aims the PTZ (AutoTracker._check_mode)."""
+        ok = (self.synced() and self.cam_online("eye") and self.config["eye"]["follow"]
+              and self.config["ptz"]["enabled"] and self.flags["ptz_connected"])
+        return "eye" if ok else "ptz"
+
+    def update_main(self, now: float | None = None):
+        """MainSelector without its timers (the mock switches at once): the PTZ is main unless it is washed out
+        or offline; publishes `main` on a switch."""
+        now = now or time.time()
+        mode = self.config["failover"]["mode"]
+        if not self.eye_enabled():
+            want, why = "ptz", "PTZ camera"
+        elif not self.flags["eye_online"]:
+            want, why = "ptz", "wide camera offline"
+        elif not self.flags["camera_online"]:
+            want, why = "eye", "PTZ camera offline"
+        elif mode in ("ptz", "eye"):
+            want, why = mode, "set to the " + ("PTZ" if mode == "ptz" else "wide") + " camera"
+        elif self.flags["ptz_blinded"]:
+            want, why = "eye", "PTZ picture washed out"
+        elif self.main == "eye":
+            want, why = "ptz", "PTZ picture clear again"
+        else:
+            want, why = "ptz", None
+        if want == self.main:
+            if why:
+                self.main_reason = why
+            return
+        self.main, self.main_reason, self.main_since = want, why or "PTZ camera", now
+        log.info("main camera: %s (%s)", self.main, self.main_reason)
+        self.hub.publish("main", {"camera": self.main, "reason": self.main_reason, "since": round(self.main_since, 3)})
+
+    def counting(self) -> str:
+        eye_ok = self.cam_online("eye")
+        if eye_ok and self.config["eye"]["count"] and (self.config["eye"]["zone"] or self.synced()):
+            return "eye"
+        return "eye" if eye_ok and self.main == "eye" else "ptz"
+
+    def counting_note(self) -> str:
+        """Pipeline._counting_note: why the wide camera does not count now."""
+        if not self.eye_enabled() or self.counting() == "eye":
+            return ""
+        if not self.config["eye"]["count"]:
+            return "counting on the wide camera is off"
+        if not self.cam_online("eye"):
+            return "the wide camera is offline"
+        if not self.config["eye"]["zone"] and not self.synced():
+            return "the wide camera needs the camera sync, or a zone drawn on its picture"
+        return ""
+
+    def target_for(self, cam: str):
+        """The target as each camera's tracker numbers it (Pipeline._target_for)."""
+        p = self.ptz
+        if not p.autotrack or p.target_id is None:
+            return None
+        if self.ptz_mode() == "eye":
+            if cam == "eye":
+                return p.target_id
+            return self.match_id()
+        return p.target_id if cam == "ptz" else None
+
+    def match_id(self):
+        """The PTZ track of the eye's target, when the PTZ can see it."""
+        p = self.ptz
+        if self.ptz_mode() != "eye" or p.target_id is None or p.target_id < EYE_ID_BASE:
+            return None
+        aid = p.target_id - EYE_ID_BASE
+        view = p.view()
+        for a in self.actors:
+            if a.id == aid and to_view(a.box(time.time()), view) is not None:
+                return aid
+        return None
+
     # ---- live scene
     def step_actors(self, now: float):
         self.actors = [a for a in self.actors if a.alive(now)]
@@ -652,37 +838,53 @@ class Mock:
             self._next_actor += 1
             self._next_spawn = now + self.rng.uniform(1.5, 4.0)
 
-    def visible_tracks(self, now: float) -> list[dict]:
-        view = self.ptz.view()
+    def visible_tracks(self, now: float, cam: str = "ptz") -> list[dict]:
+        view = EYE_VIEW if cam == "eye" else self.ptz.view()
+        base = EYE_ID_BASE if cam == "eye" else 0
+        target = self.target_for(cam)
         out = []
         for a in self.actors:
             vb = to_view(a.box(now), view)
             if vb is None:
                 continue
             age = now - a.t0
-            out.append({"id": a.id, "category": a.cat, "label": a.label,
+            out.append({"id": base + a.id, "category": a.cat, "label": a.label,
                         "score": round(a.score + 0.03 * math.sin(now * 2 + a.id), 2),
                         "box": [round(v, 4) for v in vb], "moving": True, "counted": age > 1.5,
-                        "target": self.ptz.autotrack and a.id == self.ptz.target_id})
+                        "target": target is not None and base + a.id == target})
         return out
 
-    def scene_objs(self, now: float) -> list:
-        return [(a.id, a.cat, a.label, a.score, a.box(now), self.ptz.autotrack and a.id == self.ptz.target_id,
-                 a.ltr) for a in self.actors]
+    def scene_objs(self, now: float, cam: str = "ptz") -> list:
+        base = EYE_ID_BASE if cam == "eye" else 0
+        target = self.target_for(cam)
+        return [(a.id, a.cat, a.label, a.score, a.box(now), target is not None and base + a.id == target, a.ltr)
+                for a in self.actors]
 
-    async def live_jpeg(self, overlay: bool) -> bytes:
+    def render_cam(self, cam: str, overlay: bool, width: int, quality: int) -> bytes:
+        """One frame of a camera ("ptz" | "eye"), or the offline picture."""
+        if not self.cam_online(cam):
+            return Renderer.offline(width, quality)
+        now = time.time()
+        if cam == "eye":
+            rect = self.ptz.view() if self.synced() else None
+            return self.renderer.render(EYE_VIEW, self.scene_objs(now, "eye"), overlay, now, width, True, quality,
+                                        name=self.config["eye"]["name"], rect=rect)
+        return self.renderer.render(self.ptz.view(), self.scene_objs(now, "ptz"), overlay, now, width, True, quality,
+                                    washout=self.flags["ptz_blinded"])
+
+    async def live_jpeg(self, cam: str, overlay: bool, width: int = LIVE_W) -> bytes:
         tick = int(time.time() * LIVE_FPS)
-        hit = self.frame_cache.get(overlay)
+        key = (cam, overlay, width)
+        hit = self.frame_cache.get(key)
         if hit and hit[0] == tick:
             return hit[1]
-        async with self.frame_locks[overlay]:
-            hit = self.frame_cache.get(overlay)
+        lock = self.frame_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            hit = self.frame_cache.get(key)
             if hit and hit[0] == tick:
                 return hit[1]
-            now = time.time()
-            data = await asyncio.to_thread(self.renderer.render, self.ptz.view(), self.scene_objs(now),
-                                           overlay, now, LIVE_W, True, 72)
-            self.frame_cache[overlay] = (tick, data)
+            data = await asyncio.to_thread(self.render_cam, cam, overlay, width, 72)
+            self.frame_cache[key] = (tick, data)
             return data
 
     def step_ptz(self, now: float, dt: float):
@@ -701,6 +903,9 @@ class Mock:
                 p.zoom = min(VISCA_ZOOM_MAX, max(0.0, p.zoom + p.zoom_v * 9000 * dt))
         p.steering = False
         if not p.autotrack or p.pan_v or p.tilt_v:
+            return
+        if self.ptz_mode() == "eye":
+            self.step_eye_aim(now, dt)
             return
         cfg = self.config["ptz"]
         view = p.view()
@@ -736,26 +941,114 @@ class Mock:
                 p.zoom = max(0.0, p.zoom - 1200 * dt)
                 p.steering = True
 
+    def step_eye_aim(self, now: float, dt: float):
+        """Eye mode: the wide camera (which sees every actor) picks the target, and the PTZ is pointed straight at
+        it through the sync map, even when it is outside the PTZ's own view."""
+        p, cfg = self.ptz, self.config["ptz"]
+        eye_tracks = {t["id"]: t for t in self.visible_tracks(now, "eye")}
+        if p.target_id not in eye_tracks:
+            if p.target_id is not None and p.target_id < EYE_ID_BASE:  # a PTZ track was clicked: find it in the eye
+                p.target_id += EYE_ID_BASE
+            if p.target_id not in eye_tracks:
+                cands = [t for t in eye_tracks.values()
+                         if t["counted"] and t["category"] in cfg["autotrack_categories"]]
+                if not cands:
+                    p.target_id = None
+                    p.lost_since = p.lost_since or now
+                    if now - p.lost_since > cfg["return_home_seconds"]:
+                        p.cx, p.cy, p.zoom = HOME[0], HOME[1], 0.0
+                    return
+                best = max(cands, key=lambda t: (t["box"][2] - t["box"][0]) * (t["box"][3] - t["box"][1]))
+                p.target_id = best["id"]
+                p.lost_since = None
+        b = eye_tracks[p.target_id]["box"]  # the eye sees the whole still: its box is in world coordinates
+        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+        k = min(1.0, 4.0 * dt)  # absolute moves: quick, and they do not overshoot
+        if abs(cx - p.cx) > 0.004 or abs(cy - p.cy) > 0.004:
+            p.cx += (cx - p.cx) * k
+            p.cy += (cy - p.cy) * k
+            p.steering = True
+        if cfg["autozoom"]:
+            vs_want = min(VIEW_BASE, max(0.05, (b[3] - b[1]) / max(0.1, cfg["target_size"])))
+            zoom_want = min(cfg["max_zoom_pos"], max(0.0, (VIEW_BASE / vs_want - 1) * VISCA_ZOOM_MAX / 3))
+            if abs(zoom_want - p.zoom) > 150:
+                p.zoom += (zoom_want - p.zoom) * k
+                p.steering = True
+
     # ---- status
+    def cam_status(self, cam: str, now: float) -> dict:
+        online = self.cam_online(cam)
+        up = now - self.started
+        if cam == "eye":
+            white = 3.2 + 0.4 * math.sin(now / 13)
+            fps = round(14.9 + 0.08 * math.sin(now / 5), 1) if online else 0.0
+            rec_on = self.flags["eye_recorder_online"] and online
+            name = self.config["eye"]["name"]
+            blinded = False
+        else:
+            blinded = self.flags["ptz_blinded"]
+            white = 86.0 + 2 * math.sin(now / 9) if blinded else 6.5 + 1.5 * math.sin(now / 17)
+            fps = round(14.85 + 0.1 * math.sin(now / 7), 1) if online else 0.0
+            rec_on = self.flags["recorder_online"] and online
+            name = self.config["camera"]["name"]
+        night = Renderer.daylight(now) < 0.08 and cam == self.main and self.config["lowlight"]["mode"] != "off"
+        return {"name": name, "online": online, "fps": fps,
+                "last_frame_age": 0.05 if online else round(up % 60 + 5, 1),
+                "white": round(white, 1) if online else 0.0, "blinded": blinded and online, "night": night and online,
+                "luma": round(30 + 90 * Renderer.daylight(now), 1),
+                "recorder": {"online": rec_on, "buffer_seconds": round(min(118.0, up), 1)}}
+
     def status(self) -> dict:
         now = time.time()
         up = now - self.started
-        cam_on, det_on = self.flags["camera_online"], self.flags["detector_online"]
+        det_on = self.flags["detector_online"]
         model = Path(self.config["detect"]["model"]).stem
-        fps = round(14.85 + 0.1 * math.sin(now / 7), 1) if cam_on else 0.0
         cfg_ptz = self.config["ptz"]
+        cameras = {"ptz": self.cam_status("ptz", now)}
+        if self.eye_enabled():
+            cameras["eye"] = self.cam_status("eye", now)
+        main = cameras[self.main] if self.main in cameras else cameras["ptz"]
+        fps = max(c["fps"] for c in cameras.values())
+        p = self.ptz
+        mode = self.ptz_mode()
+        synced = self.synced()
+        ll = self.config["lowlight"]
+        br = self.config["brightness"]
+        # Auto brightness stretches a hazy daytime PTZ picture; nothing to stretch at night or when blinded.
+        hazy = self.main == "ptz" and not main["night"] and not main["blinded"] and main["white"] > 5
+        gain = 1.35 if hazy else 1.0
         return {
             "time": round(now, 3), "uptime": round(up, 1), "version": "1.0.0-mock",
-            "camera": {"name": self.config["camera"]["name"], "online": cam_on, "fps": fps,
-                       "width": 1280, "height": 720, "last_frame_age": 0.05 if cam_on else round(up % 60 + 5, 1)},
-            "detector": {"online": det_on and cam_on, "model": model, "device": "HAILO10H",
+            "camera": {"name": main["name"], "online": main["online"], "fps": main["fps"],
+                       "width": 1280, "height": 720, "last_frame_age": main["last_frame_age"]},
+            "cameras": cameras,
+            "main": {"camera": self.main, "reason": self.main_reason, "since": round(self.main_since, 3),
+                     "mode": self.config["failover"]["mode"]},
+            "counting": self.counting(),
+            "counting_note": self.counting_note(),
+            "sync": {"calibrated": synced, "created": round(self.sync_created, 3) if synced else None,
+                     # tools/sync_when_clear.py's progress (flag sync_scheduled)
+                     "scheduled": ({"state": "waiting", "since": round(self.started, 3), "clear_for": 240,
+                                    "need": 600, "error": None, "updated": round(now, 3)}
+                                   if self.flags["sync_scheduled"] and not synced else None),
+                     "positions": 28 if synced else 0,
+                     "residuals": ({"pan_median": 6.1, "pan_max": 19.4, "tilt_median": 4.2, "tilt_max": 13.0,
+                                    "eye_median": 0.0123, "eye_max": 0.0371} if synced else {})},
+            "detector": {"online": det_on and main["online"], "model": model, "device": "HAILO10H",
                          "fps": fps if det_on else 0.0,
-                         "infer_ms": round(28.1 + 0.6 * math.sin(now / 3), 1) if det_on else 0.0},
-            "recorder": {"online": self.flags["recorder_online"] and cam_on,
-                         "buffer_seconds": round(min(118.0, up), 1)},
+                         "infer_ms": round(28.1 + 0.6 * math.sin(now / 3), 1) if det_on else 0.0, "error": None},
+            "recorder": cameras["ptz"]["recorder"],
             "ptz": {"enabled": cfg_ptz["enabled"], "connected": self.flags["ptz_connected"],
-                    "moving": self.ptz.moving, "autotrack": self.ptz.autotrack, "autozoom": cfg_ptz["autozoom"],
-                    "target_id": self.ptz.target_id if self.ptz.autotrack else None, "zoom": int(self.ptz.zoom)},
+                    "moving": p.moving, "autotrack": p.autotrack, "autozoom": cfg_ptz["autozoom"],
+                    "target_id": p.target_id if p.autotrack else None, "zoom": int(p.zoom),
+                    "home_preset": cfg_ptz["home_preset"], "autofocus": cfg_ptz["autofocus"], "paused_for": 0.0,
+                    "mode": mode, "match_id": self.match_id() if mode == "eye" else None},
+            "brightness": {"auto": br["auto"], "detect": br["detect"], "gain": gain, "white": main["white"],
+                           "blinded": main["blinded"], "camera": self.main},
+            "lowlight": {"mode": ll["mode"], "active": main["night"], "luma": main["luma"],
+                         "model": Path(ll["model"]).stem if ll["model"] else None,
+                         "enhance_ms": 19.2 if main["night"] else None, "detect": ll["detect"],
+                         "save_clips": ll["save_clips"]},
             "system": {"cpu_percent": round(34 + 6 * math.sin(now / 11), 1),
                        "cpu_temp": round(57.5 + 2 * math.sin(now / 23), 1),
                        "mem_percent": 12.3, "disk_free_gb": 100.2,
@@ -764,25 +1057,54 @@ class Mock:
             "today": self.store.counts_for_day(local_day(now)),
         }
 
+    def publish_tracks(self, now: float):
+        for cam in ("ptz", "eye"):
+            if cam == "eye" and not self.eye_enabled():
+                continue
+            if self.cam_online(cam):
+                self.hub.publish("tracks", {"ts": round(now, 3), "camera": cam, "main": cam == self.main,
+                                            "tracks": self.visible_tracks(now, cam)})
+
     # ---- live events
-    def create_live_event(self, hold: float = 5.0) -> dict:
+    def create_live_event(self, hold: float = 5.0, wide_hold: float | None = None) -> dict:
         now = time.time()
         cat = pick(self.rng, [("vehicle", 50), ("person", 28), ("bicycle", 10), ("motorcycle", 5),
                               ("animal", 7)])
         group = self.store.add_group(now - 0.5, cat)
-        ev = self.store.new_event(now - 0.5, "pending")
+        night = self.cam_status(self.main, now)["night"] and self.config["lowlight"]["save_clips"]
+        clips = self.config["eye"]["clips"]
+        eye = self.eye_enabled() and clips != "never"
+        # With eye.clips "auto" the wide clip is kept only when the PTZ clip does not show the whole scene.
+        keep = clips == "always" or self.main == "eye" or self.ptz.autotrack or self.ptz_away()
+        ev = self.store.new_event(now - 0.5, "pending", wide="pending" if eye else None, main=self.main,
+                                  night=night, night_status="pending")
         for t in group:
             self.store.attach(t, ev)
         self.hub.publish("counts", self.store.counts_for_day(local_day(now)))
         self.hub.publish("event_new", self.store.event_json(ev))
-        asyncio.get_running_loop().call_later(hold, self.finish_clip, ev["id"])
+        loop = asyncio.get_running_loop()
+        # A camera that is offline when the event opens has nothing in its ring: its clip fails.
+        loop.call_later(hold, self.finish_clip, ev["id"], "clip", self.cam_online("ptz"))
+        if eye:  # the wide clip is encoded, so it comes a little later
+            loop.call_later(hold + 2 if wide_hold is None else wide_hold, self.finish_clip, ev["id"], "clip_wide",
+                            self.cam_online("eye"), keep)
+        if night:
+            loop.call_later(hold + 1, self.finish_clip, ev["id"], "clip_night")
         return ev
 
-    def finish_clip(self, eid: int):
+    def ptz_away(self) -> bool:
+        p = self.ptz
+        return abs(p.cx - HOME[0]) > 0.02 or abs(p.cy - HOME[1]) > 0.02 or p.zoom > 100
+
+    def finish_clip(self, eid: int, kind: str = "clip", ok: bool = True, keep: bool = True):
         ev = self.store.events.get(eid)
-        if not ev or ev["clip_status"] != "pending":
+        key = f"{kind}_status"
+        if not ev or ev.get(key) != "pending":
             return
-        ev["clip_status"] = "ready" if self.clip_path else "failed"
+        if not keep:  # a wide clip that adds nothing is dropped (EventManager._wide_clip_done)
+            ev[key] = None
+        else:
+            ev[key] = "ready" if ok and f"{kind}.mp4" in self.clips else "failed"
         ev["version"] += 1
         self.hub.publish("event_update", self.store.event_json(ev))
 
@@ -819,10 +1141,29 @@ def _cats(p, v):
     return v
 
 
+def _choice(*allowed):
+    return lambda p, v: v if v in allowed else _fail(f"{p} must be one of {', '.join(map(str, allowed))}")
+
+
 RULES = {
     "camera.name": lambda p, v: v if 1 <= len(v.strip()) <= 40 else _fail(f"{p} must be 1-40 characters"),
     "camera.rtsp_url": lambda p, v: v if v.startswith("rtsp://") else _fail(f"{p} must start with rtsp://"),
     "camera.visca_port": lambda p, v: _num(p, v, 1, 65535, True),
+    "camera.anti_flicker": lambda p, v: _num(p, v, -1, 2, True),
+    "eye.width": lambda p, v: _num(p, v, 320, 1920, True),
+    "eye.height": lambda p, v: _num(p, v, 180, 1080, True),
+    "eye.fps": lambda p, v: _num(p, v, 5, 30, True),
+    "eye.anti_flicker": lambda p, v: _num(p, v, -1, 2, True),
+    "eye.zone": _zone,
+    "eye.clips": _choice("auto", "always", "never"),
+    "failover.mode": _choice("auto", "ptz", "eye"),
+    "failover.white": lambda p, v: _num(p, v, 0.05, 1.0),
+    "failover.switch_after": lambda p, v: _num(p, v, 0, 3600),
+    "failover.return_after": lambda p, v: _num(p, v, 0, 86400),
+    "lowlight.mode": _choice("auto", "on", "off"),
+    "lowlight.model": lambda p, v: v if v == "" or v in LOWLIGHT_MODELS else _fail(f"unknown low-light model {v}"),
+    "lowlight.night_luma": lambda p, v: _num(p, v, 1, 200),
+    "lowlight.day_luma": lambda p, v: _num(p, v, 2, 250),
     "detect.model": lambda p, v: v if v in MODELS else _fail(f"unknown model {v}"),
     "detect.min_move": lambda p, v: _num(p, v, 0.05, 5),
     "detect.zone": _zone,
@@ -919,38 +1260,47 @@ async def api_status(request):
     return web.json_response(M(request).status())
 
 
+def _camera(request):
+    """?camera=main (default: whichever is main right now), ptz or eye, as in ptzcam/web.py."""
+    cam = request.query.get("camera", "main")
+    return cam if cam in ("main", "ptz", "eye") else None
+
+
 async def api_live(request):
     m = M(request)
     overlay = request.query.get("overlay", "1") != "0"
-    if not m.flags["camera_online"]:
-        return jerr(503, "camera offline")
+    cam = _camera(request)
+    if cam is None:
+        return jerr(400, "camera must be main, ptz or eye")
     resp = web.StreamResponse(headers={"Content-Type": "multipart/x-mixed-replace; boundary=frame",
                                        "Cache-Control": "no-cache, no-store, must-revalidate",
                                        "Pragma": "no-cache"})
     await resp.prepare(request)
     try:
-        while m.flags["camera_online"]:
-            jpg = await m.live_jpeg(overlay)
+        while True:
+            which = m.resolve(cam)  # re-read each frame: "main" follows a failover at once
+            online = m.cam_online(which)
+            jpg = await m.live_jpeg(which, overlay)
             await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(jpg)
                              + jpg + b"\r\n")
-            await asyncio.sleep(1 / LIVE_FPS)
-    except ConnectionResetError:
+            # Like the real server: a camera without new frames repeats its "Camera offline" picture every 2 s.
+            await asyncio.sleep(1 / LIVE_FPS if online else 2.0)
+    except (ConnectionResetError, asyncio.CancelledError):
         pass
     return resp
 
 
 async def api_frame(request):
     m = M(request)
-    if not m.flags["camera_online"]:
-        return jerr(503, "camera offline")
     try:
-        width = max(160, min(1920, int(request.query.get("width", "1280"))))
+        width = max(160, min(1920, int(request.query.get("width", "1280")))) // 2 * 2
     except ValueError:
         return jerr(400, "width must be an integer")
-    overlay = request.query.get("overlay", "0") == "1"
-    now = time.time()
-    data = await asyncio.to_thread(m.renderer.render, m.ptz.view(), m.scene_objs(now), overlay, now, width,
-                                   True, 85)
+    cam = _camera(request)
+    if cam is None:
+        return jerr(400, "camera must be main, ptz or eye")
+    overlay = request.query.get("overlay", "0") != "0"
+    data = await asyncio.to_thread(m.render_cam, m.resolve(cam), overlay, width, 85)
     return web.Response(body=data, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
@@ -1146,7 +1496,10 @@ async def api_ptz_autotrack(request):
         p.target_id = None
     else:
         alive = {a.id for a in m.actors}
-        p.target_id = track_id if track_id in alive else None
+        aid = track_id - EYE_ID_BASE if track_id is not None and track_id >= EYE_ID_BASE else track_id
+        p.target_id = track_id if aid in alive else None
+        if p.target_id is not None and p.target_id < EYE_ID_BASE and m.ptz_mode() == "eye":
+            p.target_id += EYE_ID_BASE  # the eye leads: a PTZ pick is found in the eye's picture (here: at once)
     return web.json_response({"ok": True, "autotrack": p.autotrack, "target_id": p.target_id})
 
 
@@ -1169,16 +1522,26 @@ async def api_config_put(request):
         merge_config(new, patch, DEFAULT_CONFIG)
         if new["events"]["preroll_seconds"] >= new["events"]["clip_seconds"]:
             raise ValueError("events.preroll_seconds must be shorter than events.clip_seconds")
+        if new["lowlight"]["night_luma"] >= new["lowlight"]["day_luma"]:
+            raise ValueError("lowlight.night_luma must be below lowlight.day_luma")
+        if new["eye"]["enabled"] and not new["eye"]["device"].strip():
+            raise ValueError("eye.device must name the USB camera")
     except ValueError as exc:
         return jerr(400, str(exc))
     restarted = any(get_path(new, k) != get_path(m.config, k) for k in RESTART_KEYS)
     m.config = new
+    if restarted:
+        m.ptz.target_id = None  # old track ids mean nothing to the new trackers
+    m.update_main()
     log.info("config updated: %s%s", json.dumps(patch), " (pipeline restarted)" if restarted else "")
+    m.hub.publish("status", m.status())
     return web.json_response({"ok": True, "config": masked(new), "restarted": restarted})
 
 
 async def api_models(request):
-    return web.json_response({"models": MODELS, "current": M(request).config["detect"]["model"]})
+    cfg = M(request).config
+    return web.json_response({"models": MODELS, "current": cfg["detect"]["model"],
+                              "lowlight_models": LOWLIGHT_MODELS, "lowlight_current": cfg["lowlight"]["model"]})
 
 
 async def media(request):
@@ -1187,10 +1550,10 @@ async def media(request):
     name = request.match_info["name"]
     if not ev or ev["day"] != request.match_info["day"]:
         raise web.HTTPNotFound()
-    if name == "clip.mp4":
-        if ev["clip_status"] != "ready" or not m.clip_path:
+    if name in ("clip.mp4", "clip_wide.mp4", "clip_night.mp4"):
+        if ev.get(f"{name[:-4]}_status") != "ready" or name not in m.clips:
             raise web.HTTPNotFound()
-        return web.FileResponse(m.clip_path, headers={"Cache-Control": "max-age=3600"})
+        return web.FileResponse(m.clips[name], headers={"Cache-Control": "max-age=3600"})
     if name in ("snapshot.jpg", "thumb.jpg"):
         data = await asyncio.to_thread(m.event_media, ev, name)
         return web.Response(body=data, content_type="image/jpeg", headers={"Cache-Control": "max-age=300"})
@@ -1203,14 +1566,17 @@ async def mock_state(request):
     for k, v in body.items():
         if k in m.flags and isinstance(v, bool):
             m.flags[k] = v
+    m.update_main()
     m.hub.publish("status", m.status())
-    return web.json_response({"ok": True, "flags": m.flags})
+    return web.json_response({"ok": True, "flags": m.flags, "main": m.main})
 
 
 async def mock_event(request):
     m = M(request)
     body = await read_json(request) if request.can_read_body else {}
-    ev = m.create_live_event(hold=float(body.get("hold", 5)))
+    wide_hold = body.get("wide_hold")
+    ev = m.create_live_event(hold=float(body.get("hold", 5)),
+                             wide_hold=float(wide_hold) if wide_hold is not None else None)
     return web.json_response(m.store.event_json(ev))
 
 
@@ -1247,16 +1613,16 @@ async def ticker(app):
         dt, prev = now - prev, now
         m.step_actors(now)
         m.step_ptz(now, dt)
+        m.update_main(now)
         if now - last_tracks >= 0.2:
             last_tracks = now
-            if m.flags["camera_online"]:
-                m.hub.publish("tracks", {"ts": round(now, 3), "tracks": m.visible_tracks(now)})
+            m.publish_tracks(now)
         if now - last_status >= 2.0:
             last_status = now
             m.hub.publish("status", m.status())
         if m.args.event_interval > 0 and now >= next_event:
             next_event = now + m.rng.uniform(0.75, 1.25) * m.args.event_interval
-            if m.flags["camera_online"]:
+            if m.cam_online(m.main):
                 m.create_live_event()
 
 
@@ -1311,6 +1677,7 @@ def main():
     ap.add_argument("--days", type=int, default=6, help="days of events to generate (stats cover 60 days)")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--event-interval", type=float, default=20.0, help="seconds between live events; 0 = off")
+    ap.add_argument("--no-eye", action="store_true", help="start without the wide camera (eye.enabled false)")
     ap.add_argument("--verbose", action="store_true", help="log every request")
     args = ap.parse_args()
     if args.port == 8080:

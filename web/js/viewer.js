@@ -1,5 +1,7 @@
 // viewer.js: event viewer modal: clip (snapshot as poster) or snapshot, object list,
 // downloads, delete, older/newer navigation (buttons and arrow keys), focus trap.
+// Events recorded with the wide camera have two clips: the PTZ camera's close-up (clip_url)
+// and the wide camera's (clip_wide_url). The viewer starts on the camera that was main.
 import { api, bus, mediaSrc } from './api.js';
 import { CAT, DIRS, h, icon, catChip, eventTitle, sortCats, fmtTime, fmtDate, evDay, capitalize, toast, confirmDialog } from './ui.js';
 
@@ -9,12 +11,14 @@ let index = -1;
 let loadOlder = null;   // async () => [older events] (History paging), optional
 let opener = null;      // element to refocus on close
 let mode = 'video';     // 'video' | 'snapshot'
+let camPick = null;     // 'ptz' | 'eye' picked for the event on screen; null = the camera that was main
 let detailSeq = 0;
 let backdropDown = false;
 const details = new Map();       // event id -> objects
 const unplayable = new Set();    // clip URLs this browser failed to play
 let preferNight = true;          // show the night-vision clip when an event has one
 let videoEventId = null;         // event whose clip the video element holds
+let videoLead = 0;               // seconds that clip starts before the event window
 try { preferNight = localStorage.getItem('ptzcam.nightClip') !== '0'; } catch { /* storage blocked */ }
 
 const current = () => list[index];
@@ -27,6 +31,7 @@ export function openViewer({ list: items, index: i = 0, loadOlder: older = null 
   index = Math.min(Math.max(0, i), list.length - 1);
   loadOlder = older;
   mode = 'video';
+  camPick = null;
   if (!els.dlg.open) {
     opener = document.activeElement;
     els.dlg.showModal();
@@ -77,13 +82,7 @@ function render() {
 
   renderMedia(ev);
 
-  // Downloads: the clip being shown
-  const stamp = fileStamp(ev);
-  const clip = clipChoice(ev);
-  const clipReady = !!clip.url;
-  setLink(els.dlMp4, clip.url, `ptzcam-${stamp}${clip.night ? '-night' : ''}.mp4`);
-  setLink(els.dlJpg, ev.snapshot_url ? mediaSrc(ev.snapshot_url, ev.id) : null, `ptzcam-${stamp}.jpg`);
-  els.dlMp4.title = clipReady ? 'Download the clip' : ev.clip_status === 'pending' ? 'The clip is still being processed' : 'No clip for this event';
+  renderDownloads(ev);
 
   // Navigation: older = further down the newest-first list
   els.prev.disabled = !(index < list.length - 1 || loadOlder);
@@ -92,17 +91,102 @@ function render() {
   loadDetails(ev);
 }
 
-/** Which clip to play: the night-vision one when it exists and is preferred (or is the only one). */
+/** Downloads: the clip being shown. */
+function renderDownloads(ev) {
+  const stamp = fileStamp(ev);
+  const clip = clipChoice(ev);
+  const clipReady = !!clip.url;
+  const wide = clip.cam === 'eye' ? '-wide' : '';
+  setLink(els.dlMp4, clip.url, `ptzcam-${stamp}${wide}${clip.night ? '-night' : ''}.mp4`);
+  setLink(els.dlJpg, ev.snapshot_url ? mediaSrc(ev.snapshot_url, ev.id) : null, `ptzcam-${stamp}.jpg`);
+  els.dlMp4.title = clipReady ? 'Download the clip' : clipStatus(ev, clip.cam) === 'pending' ? 'The clip is still being processed' : 'No clip for this event';
+}
+
+/* ------------------------------------------------------------------ cameras and clips */
+
+/** The event was recorded with the wide camera too. */
+const hasWideClip = (ev) => ['pending', 'ready', 'failed'].includes(ev.clip_wide_status);
+
+/** Night vision runs on the main camera: the night clip is the camera's that was main when the event opened. */
+const nightCam = (ev) => (ev.main_camera === 'eye' ? 'eye' : 'ptz');
+const hasNightClip = (ev) => !!ev.night && ['pending', 'ready'].includes(ev.clip_night_status);
+
+/**
+ * There is wide-camera footage: its clip, or (wide clips off) its night-vision clip when it was main at night.
+ * Then the camera toggle offers it, so the night clip is never paired with the other camera's original.
+ */
+const hasWide = (ev) => hasWideClip(ev) || (hasNightClip(ev) && nightCam(ev) === 'eye');
+
+/** The camera that was main when the event opened: its photo, and its night-vision clip. */
+const mainCam = (ev) => (ev.main_camera === 'eye' && hasWide(ev) ? 'eye' : 'ptz');
+
+const clipStatus = (ev, cam) => (cam === 'eye' ? ev.clip_wide_status : ev.clip_status);
+const clipUrl = (ev, cam) => (cam === 'eye' ? ev.clip_wide_url : ev.clip_url);
+
+/** A camera's clip can still be watched: not failed and not one this browser couldn't play (for the wide camera
+ * without a clip of its own: its night-vision clip). */
+function usableClip(ev, cam) {
+  if (cam === 'eye' && !hasWideClip(ev)) return hasNightClip(ev) && !unplayable.has(ev.clip_night_url);
+  const url = clipUrl(ev, cam);
+  return clipStatus(ev, cam) !== 'failed' && !(url && unplayable.has(url));
+}
+
+/** Two clips to choose from (one that failed for good leaves nothing to choose). */
+const camChoiceShown = (ev) => hasWide(ev) && (usableClip(ev, 'ptz') || usableClip(ev, 'eye'));
+
+/** The camera on screen: the one picked, else the main one; the other when that clip failed. */
+function camFor(ev) {
+  if (!hasWide(ev)) return 'ptz';
+  const main = mainCam(ev);
+  const want = camPick || main;
+  if (usableClip(ev, want)) return want;
+  const other = want === 'eye' ? 'ptz' : 'eye';
+  return usableClip(ev, other) ? other : want;
+}
+
+/**
+ * Seconds a clip starts before the event window: camera clips start on a whole recording segment
+ * (clip_lead, clip_wide_lead); the night-vision clip starts on the window itself.
+ */
+function clipLead(ev, clip) {
+  if (clip.night) return 0;
+  return Number(clip.cam === 'eye' ? ev.clip_wide_lead : ev.clip_lead) || 0;
+}
+
+/**
+ * Which clip to play: the chosen camera's, or its night-vision version when that exists and is preferred
+ * (or is the only one). Night vision runs on the main camera, so only the main camera has one.
+ */
 function clipChoice(ev) {
-  const night = ev.clip_night_status === 'ready' && !!ev.clip_night_url && !unplayable.has(ev.clip_night_url);
-  const orig = ev.clip_status === 'ready' && !!ev.clip_url && !unplayable.has(ev.clip_url);
+  const cam = camFor(ev);
+  const nightOk = cam === nightCam(ev);
+  const night = nightOk && ev.clip_night_status === 'ready' && !!ev.clip_night_url && !unplayable.has(ev.clip_night_url);
+  const url = clipUrl(ev, cam);
+  const orig = clipStatus(ev, cam) === 'ready' && !!url && !unplayable.has(url);
   const useNight = night && (preferNight || !orig);
-  return { url: useNight ? ev.clip_night_url : orig ? ev.clip_url : null, night: useNight, nightReady: night, origReady: orig };
+  return { url: useNight ? ev.clip_night_url : orig ? url : null, night: useNight, nightReady: night, origReady: orig, cam };
+}
+
+function renderCamToggle(ev) {
+  const show = camChoiceShown(ev);
+  els.vmCam.hidden = !show;
+  if (!show) return;
+  const cam = camFor(ev);
+  for (const b of [els.vmCamPtz, els.vmCamEye]) {
+    const c = b.dataset.cam;
+    const status = clipStatus(ev, c);
+    const label = c === 'eye' ? 'wide camera' : 'PTZ close-up';
+    b.setAttribute('aria-pressed', String(c === cam));
+    b.disabled = !usableClip(ev, c);
+    b.title = status === 'failed' ? `No ${c === 'eye' ? 'wide' : 'close-up'} clip for this event`
+      : status === 'pending' ? `The ${label} clip is still being processed`
+        : `Show the ${label} clip${c === mainCam(ev) ? ' (main camera)' : ''}`;
+  }
 }
 
 function renderNightToggle(ev) {
   const status = ev.clip_night_status;
-  const has = !!ev.night && (status === 'ready' || status === 'pending');
+  const has = hasNightClip(ev) && camFor(ev) === nightCam(ev) && (status === 'ready' || status === 'pending');
   els.vmNight.hidden = !has;
   if (!has) return;
   const ready = status === 'ready' && !unplayable.has(ev.clip_night_url);
@@ -117,20 +201,25 @@ function renderMedia(ev) {
   const clip = clipChoice(ev);
   const clipReady = !!clip.url;
   const showVideo = mode === 'video' && clipReady;
+  const status = clipStatus(ev, clip.cam);
+  renderCamToggle(ev);
   renderNightToggle(ev);
   els.vmVideo.setAttribute('aria-pressed', String(showVideo));
   els.vmSnap.setAttribute('aria-pressed', String(!showVideo));
   els.vmVideo.disabled = !clipReady;
-  els.vmVideo.title = clipReady ? 'Play the clip' : ev.clip_status === 'pending' ? 'The clip is still being processed' : 'No clip available';
+  els.vmVideo.title = clipReady ? 'Play the clip' : status === 'pending' ? 'The clip is still being processed' : 'No clip available';
 
   if (showVideo) {
     els.img.hidden = true;
     els.video.hidden = false;
     if (els.video.getAttribute('src') !== clip.url) {
-      const at = videoEventId === ev.id ? els.video.currentTime : 0; // switching versions of this event's clip
+      // Switching versions of this event's clip (camera, night vision): the same moment in the other one.
+      const lead = clipLead(ev, clip);
+      const at = videoEventId === ev.id ? Math.max(0, els.video.currentTime - videoLead + lead) : 0;
       els.video.poster = mediaSrc(ev.snapshot_url, ev.id);
       els.video.src = clip.url;
       videoEventId = ev.id;
+      videoLead = lead;
       if (at) els.video.addEventListener('loadedmetadata', () => { els.video.currentTime = at; }, { once: true }); // same moment in the other version
       const p = els.video.play();
       if (p && p.catch) p.catch(() => { /* autoplay refused: the controls are there */ });
@@ -145,10 +234,13 @@ function renderMedia(ev) {
     els.img.alt = `Snapshot: ${eventTitle(ev)}`;
     let msg = '';
     let spin = false;
-    if (mode === 'video' || ev.clip_status !== 'ready') {
-      if (ev.clip_status === 'pending') { msg = 'Processing clip…'; spin = true; }
-      else if (ev.clip_status === 'failed') msg = 'No clip for this event';
-      else if (ev.clip_url && unplayable.has(ev.clip_url)) msg = "This browser can't play the clip. Download it instead.";
+    // With two clips the notice names the one on screen.
+    const which = camChoiceShown(ev) ? (clip.cam === 'eye' ? 'wide ' : 'close-up ') : '';
+    const url = clipUrl(ev, clip.cam);
+    if (mode === 'video' || status !== 'ready') {
+      if (status === 'pending') { msg = `Processing ${which}clip…`; spin = true; }
+      else if (status === 'failed') msg = `No ${which}clip for this event`;
+      else if (url && unplayable.has(url)) msg = "This browser can't play the clip. Download it instead.";
     }
     els.overlay.hidden = !msg;
     els.overlayText.textContent = msg;
@@ -227,6 +319,7 @@ async function older() {
   if (index < list.length - 1) {
     index += 1;
     mode = 'video';
+    camPick = null;
     render();
     return;
   }
@@ -244,6 +337,7 @@ async function older() {
     list = list.concat(fresh);
     index += 1;
     mode = 'video';
+    camPick = null;
     render();
   } catch (err) {
     toast(`Couldn't load older events: ${err.message}`, { type: 'error' });
@@ -255,6 +349,7 @@ function newer() {
   if (index <= 0) return;
   index -= 1;
   mode = 'video';
+  camPick = null;
   render();
 }
 
@@ -285,6 +380,7 @@ function removeFromList(id) {
     close();
     return;
   }
+  if (i === index) camPick = null;          // a different event is about to be on screen
   if (i < index) index -= 1;                // something newer vanished: keep showing the same event
   index = Math.min(index, list.length - 1); // the shown one vanished: the next older slides into its slot
   if (els.dlg.open) render();
@@ -341,6 +437,9 @@ export function initViewer() {
     vmVideo: document.getElementById('vm-video'),
     vmSnap: document.getElementById('vm-snap'),
     vmNight: document.getElementById('vm-night'),
+    vmCam: document.getElementById('vm-cam'),
+    vmCamPtz: document.getElementById('vm-cam-ptz'),
+    vmCamEye: document.getElementById('vm-cam-eye'),
     chips: document.getElementById('viewer-chips'),
     objects: document.getElementById('obj-list'),
     dlMp4: document.getElementById('dl-mp4'),
@@ -365,6 +464,13 @@ export function initViewer() {
   els.next.addEventListener('click', newer);
   els.vmVideo.addEventListener('click', () => { mode = 'video'; renderMedia(current()); });
   els.vmSnap.addEventListener('click', () => { mode = 'snapshot'; renderMedia(current()); });
+  for (const b of [els.vmCamPtz, els.vmCamEye]) {
+    b.addEventListener('click', () => {
+      camPick = b.dataset.cam; // stays while this event is on screen; the next one starts on its main camera
+      mode = 'video';
+      render();
+    });
+  }
   els.vmNight.addEventListener('click', () => {
     preferNight = !preferNight;
     try { localStorage.setItem('ptzcam.nightClip', preferNight ? '1' : '0'); } catch { /* storage blocked */ }
@@ -378,6 +484,7 @@ export function initViewer() {
     if (!ev || !src) return;
     unplayable.add(src);
     renderMedia(ev);
+    renderDownloads(ev); // the download is the clip now on screen, not the one that failed
   });
   for (const a of [els.dlMp4, els.dlJpg]) {
     a.addEventListener('click', (e) => { if (a.getAttribute('aria-disabled') === 'true') e.preventDefault(); });

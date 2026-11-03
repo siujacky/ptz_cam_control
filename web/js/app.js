@@ -1,6 +1,6 @@
 // app.js: bootstrap, tab router, header (camera name, connection dot, clock) and the
 // "backend unreachable" banner. Tabs are modules exposing init(), show(params), hide().
-import { api, bus, state, LiveStream } from './api.js';
+import { api, bus, state, takeStatus, LiveStream } from './api.js';
 import { hydrateIcons } from './ui.js';
 import * as live from './live.js';
 import * as history from './history.js';
@@ -48,8 +48,11 @@ function route() {
   TABS[tab].show?.(params);
 }
 
+/** The site's name: the PTZ camera's (status.camera follows the main camera, which can be the wide one). */
+const siteName = (s) => s?.cameras?.ptz?.name || s?.camera?.name;
+
 function updateTitle() {
-  const name = state.status?.camera?.name || state.config?.camera?.name;
+  const name = siteName(state.status) || state.config?.camera?.name;
   document.title = `${TITLES[current] || 'Live'} · ${name || 'PTZ Camera'}`;
 }
 
@@ -81,7 +84,7 @@ function setupHeader() {
       updateTitle();
     }
   };
-  bus.on('status', (s) => applyName(s?.camera?.name));
+  bus.on('status', (s) => applyName(siteName(s)));
   bus.on('config', (c) => applyName(c?.camera?.name));
 
   bus.on('connection', ({ connected, paused }) => {
@@ -108,8 +111,7 @@ function showBanner(show, text) {
 
 async function loadStatus() {
   try {
-    const s = await api.get('/api/status', { timeout: 8000 });
-    state.status = s;
+    const s = takeStatus(await api.get('/api/status', { timeout: 8000 }));
     bus.emit('status', s);
   } catch (err) {
     statusFailed = true;
@@ -134,6 +136,9 @@ function boot() {
   stream = new LiveStream('/api/stream');
   stream.start();
   loadStatus();
+  // The settings, for hints that depend on them (e.g. why a wide-camera box can't be followed). Settings
+  // loads its own copy when opened; this one only fills the gap until then.
+  api.get('/api/config').then((c) => { if (!state.config) state.config = c; }).catch(() => {});
 
   window.addEventListener('hashchange', route);
   route();

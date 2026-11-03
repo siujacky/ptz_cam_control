@@ -1,27 +1,86 @@
 // live.js: Live tab: MJPEG live view (released whenever it is not visible), overlay
 // toggle, fullscreen, click-to-follow on tracked boxes, today counters and recent activity.
-import { api, bus, state, mediaRev } from './api.js';
-import { CATS, PRIORITY, h, icon, catChip, eventCard, cardSig, emptyState, errorState, store, fmtInt, fmtNum, evDay, today, keepFocus } from './ui.js';
+// With a wide camera ("eye"), the big view shows the main camera and a small picture-in-picture
+// the other one; tapping it swaps them (remembered per browser, with a way back to Auto).
+import { api, bus, state, mediaRev, hasEye, mainCamera, cameraStatus, tracksFor } from './api.js';
+import { CATS, PRIORITY, CAM_NAME, h, icon, catChip, eventCard, cardSig, emptyState, errorState, store, toast, fmtInt, fmtNum, evDay, today, keepFocus, capitalize, setText } from './ui.js';
 import { initPtz, followTrack } from './ptz.js';
 import { openViewer } from './viewer.js';
 
 const RETRY_MS = 2000;
 const RECENT_N = 6;
+const PIP_MS = 500;        // the picture-in-picture polls frame.jpg about twice a second: no second MJPEG connection
+const PIP_RETRY_MS = 3000;
+const CHOICES = ['auto', 'ptz', 'eye'];
 
 let els = {};
 let active = false;        // Live tab is shown
 let viewerOpen = false;
 let overlay = true;
 let streaming = false;     // the <img> currently has a stream URL
+let streamCam = null;      // the camera parameter of that URL: main, ptz or eye
 let gotFrame = false;
 let retryTimer = 0;
-let cameraOnline = true;
+let cameraOnline = true;   // the camera on the big view
 let statusKnown = false;   // the first stream request waits for the first status
 let hoverId = null;
 let recent = [];
 let recentLoaded = false;
 let counts = null;
+let choice = 'auto';       // big view: auto (the main camera), or a camera the user picked
+let shownMain = null;      // the main camera the UI last rendered
+let pipCam = null;         // camera in the picture-in-picture
+let pipTimer = 0;
+let pipBusy = false;
 const recentCards = new Map();
+
+/* ------------------------------------------------------------------ which camera is big */
+
+/** The user's pick, which only applies while there is a wide camera. */
+const pick = () => (hasEye() ? choice : 'auto');
+
+/** The camera on the big view. */
+const shown = () => (pick() === 'auto' ? mainCamera() : pick());
+
+/** The stream follows the main camera by itself (the server switches it seamlessly on a failover). */
+const wantStreamCam = () => (pick() === 'auto' ? 'main' : pick());
+
+/** The camera in the picture-in-picture: the other one. */
+const otherCam = () => (shown() === 'eye' ? 'ptz' : 'eye');
+
+function setChoice(next) {
+  choice = CHOICES.includes(next) ? next : 'auto';
+  store.set('liveCamera', choice);
+  applyCamera({ posterFromPip: true });
+}
+
+/** Tap on the picture-in-picture: its camera goes big. Back on the main camera means back to Auto. */
+function swapCameras() {
+  const next = otherCam();
+  setChoice(next === mainCamera() ? 'auto' : next);
+}
+
+/**
+ * Re-derive everything that depends on which camera is big: the stream URL, the badges, the boxes and
+ * the picture-in-picture. Called on a swap, a main-camera switch and every status.
+ */
+function applyCamera({ posterFromPip = false } = {}) {
+  const s = state.status;
+  shownMain = mainCamera();
+  const wasOnline = cameraOnline;
+  cameraOnline = statusKnown && s ? cameraStatus(shown(), s)?.online !== false : cameraOnline;
+  els.stage.dataset.camera = shown();
+  renderCamBadge();
+  if (s) renderPicture(s);
+  if (streaming && streamCam !== wantStreamCam()) restartStream({ posterFromPip });
+  else if (cameraOnline !== wasOnline) {
+    if (cameraOnline) restartStream(); // camera came back: start a fresh stream
+    else syncStream();                 // gone: drop the stream until it returns
+  }
+  syncPip();
+  draw();
+  renderInView();
+}
 
 /* ------------------------------------------------------------------ MJPEG lifecycle */
 // Browsers allow ~6 connections per host and MJPEG holds one for as long as it runs, so
@@ -34,19 +93,21 @@ const wanted = () => active && !document.hidden && !viewerOpen && cameraOnline &
 function syncStream() {
   if (wanted()) startStream();
   else stopStream();
+  syncPip();
 }
 
-function streamUrl(bust) {
-  return `/api/live.mjpg?overlay=${overlay ? 1 : 0}${bust ? `&_=${Date.now()}` : ''}`;
+function streamUrl(cam, bust) {
+  return `/api/live.mjpg?camera=${cam}&overlay=${overlay ? 1 : 0}${bust ? `&_=${Date.now()}` : ''}`;
 }
 
 function startStream(bust = false) {
   clearTimeout(retryTimer);
   if (streaming && !bust) return;
   streaming = true;
+  streamCam = wantStreamCam();
   setFrame(false);
   els.stage.classList.add('is-loading');
-  els.img.src = streamUrl(bust);
+  els.img.src = streamUrl(streamCam, bust);
 }
 
 /** Whether the <img> shows real frames (it stays invisible until then: no broken icon). */
@@ -57,7 +118,7 @@ function setFrame(on) {
 }
 
 function renderBadge() {
-  const s = state.status?.camera;
+  const s = cameraStatus(shown());
   let text = 'Live';
   let cls = '';
   if (!cameraOnline) { text = 'Offline'; cls = 'is-offline'; }
@@ -78,21 +139,26 @@ function stopStream() {
   els.stage.classList.remove('is-loading');
 }
 
-function restartStream() {
-  if (!wanted()) return;
+function restartStream({ posterFromPip = false } = {}) {
+  if (!wanted()) {
+    if (streaming) stopStream();
+    return;
+  }
   freezeFrame();
+  // On a swap the picture-in-picture already shows the camera that goes big: hold that until the stream starts.
+  if (posterFromPip && els.pip.classList.contains('has-frame')) freezeFrame(els.pipImg);
   streaming = false;
   startStream(true);
 }
 
 /** Keep the last frame on a canvas so stopping or switching streams never flashes black. */
-function freezeFrame() {
-  const { img, poster } = els;
-  if (!gotFrame || !img.naturalWidth) return;
+function freezeFrame(src = els.img) {
+  const { poster } = els;
+  if (!src.naturalWidth || (src === els.img && !gotFrame)) return;
   try {
-    poster.width = img.naturalWidth;
-    poster.height = img.naturalHeight;
-    poster.getContext('2d').drawImage(img, 0, 0);
+    poster.width = src.naturalWidth;
+    poster.height = src.naturalHeight;
+    poster.getContext('2d').drawImage(src, 0, 0);
     poster.hidden = false;
   } catch {
     /* some browsers refuse to draw a multipart image; the spinner covers the gap */
@@ -130,6 +196,7 @@ function setOverlay(on) {
   els.overlayBtn.setAttribute('aria-pressed', String(on));
   els.overlayBtn.title = on ? 'Hide detection boxes' : 'Show detection boxes';
   if (streaming) restartStream();
+  if (pipCam) pollPip();
 }
 
 const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement;
@@ -162,6 +229,101 @@ function syncFsButton() {
   requestAnimationFrame(draw);
 }
 
+/* ------------------------------------------------------------------ picture-in-picture */
+// The other camera, small, in a corner of the big view. It polls single frames instead of holding a
+// second MJPEG connection (browsers allow ~6 per host) and only runs while the big view would.
+
+const pipWanted = () => hasEye() && active && !document.hidden && !viewerOpen && statusKnown;
+
+function syncPip() {
+  els.pip.hidden = !hasEye();
+  if (!pipWanted()) {
+    clearTimeout(pipTimer); // a frame in flight may land; nothing new is asked for
+    pipTimer = 0;
+    return;
+  }
+  const cam = otherCam();
+  if (cam !== pipCam) {
+    pipCam = cam;
+    els.pip.classList.remove('has-frame'); // never show the old camera under the new label
+    renderPipLabel();
+    pollPip();
+  } else if (!pipTimer && !pipBusy) {
+    pollPip();
+  }
+  els.pip.classList.toggle('is-offline', cameraStatus(cam)?.online === false);
+}
+
+function renderPipLabel() {
+  const name = CAM_NAME[pipCam] || CAM_NAME.eye;
+  els.pipLabel.textContent = name;
+  els.pip.setAttribute('aria-label', `Show the ${name.toLowerCase()} in the big view`);
+  els.pip.title = `Swap: show the ${name.toLowerCase()} big`;
+}
+
+/** Frame width for the inset: its size on screen, in 64 px steps so the server can reuse its encodes. */
+function pipWidth() {
+  const w = els.pip.getBoundingClientRect().width * (window.devicePixelRatio || 1);
+  return Math.min(640, Math.max(192, Math.ceil(w / 64) * 64));
+}
+
+function pollPip() {
+  clearTimeout(pipTimer);
+  pipTimer = 0;
+  if (!pipWanted() || !pipCam) return;
+  pipBusy = true;
+  // A new src keeps the current picture on screen until the next one has loaded: no flicker.
+  els.pipImg.src = `/api/frame.jpg?camera=${pipCam}&width=${pipWidth()}&overlay=${overlay ? 1 : 0}&_=${Date.now()}`;
+}
+
+function onPipLoad() {
+  pipBusy = false;
+  if (!els.pipImg.src.includes(`camera=${pipCam}&`)) return; // a frame of the camera that was here before
+  els.pip.classList.add('has-frame');
+  clearTimeout(pipTimer);
+  const offline = cameraStatus(pipCam)?.online === false; // the server repeats its "Camera offline" picture
+  pipTimer = pipWanted() ? setTimeout(pollPip, offline ? PIP_RETRY_MS : PIP_MS) : 0;
+}
+
+function onPipError() {
+  if (!els.pipImg.getAttribute('src')) return;
+  pipBusy = false;
+  clearTimeout(pipTimer);
+  pipTimer = pipWanted() ? setTimeout(pollPip, PIP_RETRY_MS) : 0;
+}
+
+/* ------------------------------------------------------------------ camera badge */
+
+/**
+ * Names the camera on the big view when it is not the PTZ ("Wide camera") and, when failover put it there,
+ * why. While the user has picked a camera, an Auto button hands the big view back to the main camera.
+ */
+function renderCamBadge() {
+  const eye = hasEye();
+  const cam = shown();
+  const pinned = eye && choice !== 'auto';
+  const m = state.status?.main;
+  const text = CAM_NAME[cam];
+  let why = '';
+  // Failover (or an offline PTZ) made the wide camera main; "always the wide camera" is a setting, not a reason.
+  if (eye && cam === 'eye' && !pinned && m?.camera === 'eye' && m.mode !== 'eye' && m.reason) why = capitalize(m.reason);
+  els.camBadge.hidden = !(eye && (cam === 'eye' || pinned));
+  els.camBadge.classList.toggle('is-failover', !!why);
+  setText(els.camBadgeText, why ? `${text} · ${why}` : text);
+  // Announced from a region that is always there (one that appears with its text may not be read out); setText
+  // only writes a change, so each status tick does not repeat it.
+  setText(els.camAnnounce, !eye ? '' : els.camBadge.hidden ? `${CAM_NAME.ptz} on the big view` : els.camBadgeText.textContent);
+  els.camBadge.title = why
+    ? `The wide camera took over: ${why.toLowerCase()}. The PTZ camera gets the view back once its picture is clear again.`
+    : pinned ? `You picked the ${text.toLowerCase()} for the big view` : 'The wide camera is the main camera';
+  els.camAuto.hidden = !pinned;
+  if (pinned) {
+    const main = CAM_NAME[mainCamera()].toLowerCase();
+    els.camAuto.title = `Back to automatic: the big view shows the main camera (now the ${main})`;
+  }
+  els.stageCam.hidden = els.camBadge.hidden && els.camAuto.hidden;
+}
+
 /* ------------------------------------------------------------------ click-to-follow */
 
 /** Where the image content actually sits inside the element (object-fit: contain). */
@@ -180,9 +342,22 @@ function normPoint(e) {
   return { x: (e.clientX - c.left) / c.width, y: (e.clientY - c.top) / c.height };
 }
 
+/** The boxes of the camera on the big view. */
+const shownTracks = () => (cameraOnline ? tracksFor(shown()) : []);
+
+/** Whether a box on the big view can be followed: the wide camera's only while it aims the PTZ. */
+const canFollowShown = () => shown() === 'ptz' || state.status?.ptz?.mode === 'eye';
+
+/** Why a box on the wide camera can't be followed right now. */
+function eyeFollowHint() {
+  if (state.config?.eye?.follow === false) return 'To follow from the wide camera, turn on "Wide camera steers the PTZ" in Settings';
+  if (state.status?.sync && !state.status.sync.calibrated) return 'To follow from the wide camera, calibrate the camera sync first (see Settings)';
+  return "The wide camera can't steer the PTZ right now. Tap a box in the PTZ camera's view instead.";
+}
+
 /** Smallest tracked box containing the point (small objects win over big ones behind them). */
 function pickTrack(x, y) {
-  const list = state.tracks?.tracks;
+  const list = shownTracks();
   if (!list?.length || x < 0 || x > 1 || y < 0 || y > 1) return null;
   const slack = 0.01; // a little forgiveness for fingers
   let best = null;
@@ -204,14 +379,15 @@ function onStageClick(e) {
   if (e.target.closest('button') || !gotFrame) return;
   const p = normPoint(e);
   const t = pickTrack(p.x, p.y);
-  if (t) followTrack(t);
-  else if (state.tracks?.tracks?.length) showStageToast('Tap directly on a box to follow it');
+  if (t && !canFollowShown()) toast(eyeFollowHint());
+  else if (t) followTrack(t);
+  else if (shownTracks().length) showStageToast('Tap directly on a box to follow it');
 }
 
 function onStageMove(e) {
   if (e.pointerType !== 'mouse') return;
   const p = normPoint(e);
-  const t = gotFrame ? pickTrack(p.x, p.y) : null;
+  const t = gotFrame && canFollowShown() && !e.target.closest('.pip') ? pickTrack(p.x, p.y) : null;
   const id = t ? t.id : null;
   if (id !== hoverId) {
     hoverId = id;
@@ -241,10 +417,12 @@ function draw() {
     cv.height = H;
   }
   ctx.clearRect(0, 0, W, H);
-  const list = state.tracks?.tracks;
+  const list = shownTracks();
   if (!list?.length || !gotFrame || !cameraOnline) return;
   const p = state.status?.ptz;
-  const targetId = p?.autotrack ? p.target_id : null;
+  // While the wide camera aims, its view has the target and the PTZ view the track matched to it.
+  const eyeAims = p?.mode === 'eye';
+  const targetId = !p?.autotrack ? null : shown() === 'eye' ? (eyeAims ? p.target_id : null) : eyeAims ? p.match_id : p.target_id;
   const c = contentRect();
   const ox = (c.left - box.left) * dpr;
   const oy = (c.top - box.top) * dpr;
@@ -302,9 +480,9 @@ function label(ctx, text, x, yBelow, dpr, strong, canvasH) {
 
 let inViewSig = null;
 
-/** Live summary of what the detector sees right now (SSE `tracks`, ~5 Hz). */
+/** Live summary of what the detector sees right now on the big view's camera (SSE `tracks`, ~5 Hz). */
 function renderInView() {
-  const list = (cameraOnline && state.tracks?.tracks) || [];
+  const list = shownTracks();
   const counts = {};
   for (const t of list) counts[t.category] = (counts[t.category] || 0) + 1;
   const keys = PRIORITY.filter((k) => counts[k]);
@@ -323,45 +501,49 @@ function renderStatus(s) {
   if (!s) return;
   if (!statusKnown) {
     statusKnown = true;
-    cameraOnline = s.camera?.online !== false;
+    cameraOnline = cameraStatus(shown(), s)?.online !== false;
     syncStream();
   }
-  const cam = s.camera || {};
-  const wasOnline = cameraOnline;
-  cameraOnline = cam.online !== false;
+  applyCamera(); // the camera on the big view decides the stream, the badges and the boxes
+
+  const warn = [];
+  if (s.detector && s.detector.online === false && cameraOnline) warn.push(['Detection paused', 'Detector offline']);
+  if (s.recorder && s.recorder.online === false && cameraOnline) warn.push(['Recorder offline', 'New events will have no clip']);
+  const eye = s.cameras?.eye;
+  if (eye && eye.online === false) warn.push(['Wide camera offline', 'Until it is back, the PTZ camera counts on its Home view']);
+  else if (eye?.recorder && eye.recorder.online === false) warn.push(['Wide recorder offline', 'New events will have no wide clip']);
+  els.warn.replaceChildren(...warn.map(([t, title]) => h('span', { class: 'warn-chip', title }, icon('warning'), t)));
+
+  if (s.today) setCounts(s.today);
+}
+
+/** Offline message, LIVE badge, night and brightness badges: all about the camera on the big view. */
+function renderPicture(s) {
+  const camName = shown();
+  const cam = cameraStatus(camName, s) || {};
   els.stage.classList.toggle('is-offline', !cameraOnline);
   els.msg.hidden = cameraOnline;
   if (!cameraOnline) {
-    els.msgTitle.textContent = 'Camera offline';
+    els.msgTitle.textContent = hasEye() ? `${CAM_NAME[camName]} offline` : 'Camera offline';
     const age = Number(cam.last_frame_age);
     els.msgText.textContent = Number.isFinite(age) && age > 2
       ? `No picture for ${age < 120 ? `${Math.round(age)} s` : `${Math.round(age / 60)} min`}. Trying to reconnect…`
       : 'Trying to reconnect…';
   }
   renderBadge();
-  els.night.hidden = !(cameraOnline && s.lowlight?.active);
+  // Night vision and auto brightness run on the main camera; the per-camera flags say what this one shows.
   const br = s.brightness;
-  const blinded = !!br?.blinded;
-  const boosted = !!br?.auto && Number(br.gain) > 1.05;
+  const isMain = !br?.camera || br.camera === camName;
+  const night = s.cameras ? !!cam.night : !!s.lowlight?.active;
+  els.night.hidden = !(cameraOnline && night);
+  const blinded = s.cameras ? !!cam.blinded : !!br?.blinded;
+  const boosted = isMain && !!br?.auto && Number(br.gain) > 1.05;
   els.bright.hidden = !(cameraOnline && (blinded || boosted));
   els.bright.classList.toggle('is-blinded', blinded);
   els.brightText.textContent = blinded ? 'Too bright: camera blinded' : `Brightness \u00d7${Number(br?.gain).toFixed(1)}`;
   els.bright.title = blinded
     ? 'The picture is white: direct light is overloading the camera, and nothing is left to recover. Shade it from the sun.'
     : 'Auto brightness: the washed-out picture is stretched back to full contrast';
-  if (cameraOnline !== wasOnline) {
-    if (cameraOnline) restartStream(); // camera came back: start a fresh stream
-    else syncStream();                 // gone: drop the stream until it returns
-  }
-
-  const warn = [];
-  if (s.detector && s.detector.online === false && cameraOnline) warn.push(['Detection paused', 'Detector offline']);
-  if (s.recorder && s.recorder.online === false && cameraOnline) warn.push(['Recorder offline', 'New events will have no clip']);
-  els.warn.replaceChildren(...warn.map(([t, title]) => h('span', { class: 'warn-chip', title }, icon('warning'), t)));
-
-  if (s.today) setCounts(s.today);
-  draw();
-  renderInView();
 }
 
 /* ------------------------------------------------------------------ today counters */
@@ -482,6 +664,14 @@ export function init() {
     fps: document.getElementById('live-fps'),
     overlayBtn: document.getElementById('btn-overlay'),
     fsBtn: document.getElementById('btn-fullscreen'),
+    stageCam: document.getElementById('stage-cam'),
+    camBadge: document.getElementById('cam-badge'),
+    camBadgeText: document.getElementById('cam-badge-text'),
+    camAnnounce: document.getElementById('cam-announce'),
+    camAuto: document.getElementById('btn-cam-auto'),
+    pip: document.getElementById('pip'),
+    pipImg: document.getElementById('pip-img'),
+    pipLabel: document.getElementById('pip-label'),
     stageToast: document.getElementById('stage-toast'),
     warn: document.getElementById('warn-chips'),
     inview: document.getElementById('inview'),
@@ -507,6 +697,13 @@ export function init() {
   els.overlayBtn.setAttribute('aria-pressed', String(overlay));
   els.overlayBtn.addEventListener('click', () => setOverlay(!overlay));
   els.fsBtn.addEventListener('click', toggleFullscreen);
+
+  choice = store.get('liveCamera', 'auto');
+  if (!CHOICES.includes(choice)) choice = 'auto';
+  els.pip.addEventListener('click', swapCameras);
+  els.pipImg.addEventListener('load', onPipLoad);
+  els.pipImg.addEventListener('error', onPipError);
+  els.camAuto.addEventListener('click', () => setChoice('auto'));
   document.addEventListener('fullscreenchange', syncFsButton);
   document.addEventListener('webkitfullscreenchange', syncFsButton);
   document.addEventListener('keydown', (e) => {
@@ -523,10 +720,14 @@ export function init() {
 
   bus.on('status', renderStatus);
   bus.on('counts', setCounts);
-  bus.on('tracks', () => {
-    if (!active) return;
+  bus.on('tracks', (data) => {
+    if (!active || (data?.camera && data.camera !== shown())) return; // only the big view's camera has boxes here
     draw();
     renderInView();
+  });
+  bus.on('main', () => {
+    // A failover switched cameras: an Auto stream follows on the server by itself, the rest follows here.
+    if (statusKnown && mainCamera() !== shownMain) applyCamera();
   });
   bus.on('event_new', onEventNew);
   bus.on('event_update', onEventUpdate);
@@ -544,6 +745,7 @@ export function init() {
 
   els.stage.classList.add('is-loading');
   renderBadge();
+  renderCamBadge();
   renderStatus(state.status);
   loadRecent();
   // If no status arrives (status endpoint broken), try the stream anyway.

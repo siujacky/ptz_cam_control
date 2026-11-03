@@ -1,6 +1,14 @@
 // ui.js: shared UI building blocks: category metadata, inline SVG icons, DOM helpers,
 // formatters (always the browser locale), the event card, toasts and a confirm dialog.
-import { mediaSrc } from './api.js';
+import { mediaSrc, EYE_ID_BASE } from './api.js';
+
+/* ------------------------------------------------------------------ cameras */
+
+/** "PTZ camera", "Wide camera" (the fixed USB camera, "eye" in the API). */
+export const CAM_NAME = { ptz: 'PTZ camera', eye: 'Wide camera' };
+
+/** Track number as people see it: the wide camera's ids start at EYE_ID_BASE. */
+export const trackNo = (id) => (Number(id) >= EYE_ID_BASE ? Number(id) - EYE_ID_BASE : id);
 
 /* ------------------------------------------------------------------ categories */
 
@@ -108,6 +116,9 @@ const ICONS = {
   calendar: '<rect x="3.5" y="5" width="17" height="15.5" rx="2.6"/><path d="M3.5 10h17M8 3v4M16 3v4"/>',
   moon: '<path d="M19.6 14.7A8.2 8.2 0 0 1 9.3 4.4a8.2 8.2 0 1 0 10.3 10.3z"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/>',
+  wide: '<rect x="2.8" y="6" width="18.4" height="12" rx="2.6"/><path d="M7 12h10M9.2 9.8 7 12l2.2 2.2M14.8 9.8 17 12l-2.2 2.2"/>',
+  swap: '<path d="M4.5 8h14M15 4.5 18.5 8 15 11.5M19.5 16h-14M9 12.5 5.5 16 9 19.5"/>',
+  copy: '<rect x="8.6" y="8.6" width="11" height="11" rx="2.2"/><path d="M15.4 8.6V6.6c0-1.2-.9-2.1-2.1-2.1H6.6c-1.2 0-2.1.9-2.1 2.1v6.7c0 1.2.9 2.1 2.1 2.1h2"/>',
 };
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -172,6 +183,11 @@ function appendKids(el, kids) {
 
 export const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
+/** Set an element's text only when it changed: an aria-live region would read the same words out again. */
+export function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
 /**
  * Run a re-render of `container` without losing keyboard focus: if focus was inside it,
  * put it back on the same element, or on the new element with the same data-key/data-id.
@@ -213,15 +229,26 @@ export function errorState(err, onRetry, title = "Couldn't load this") {
 
 /* ------------------------------------------------------------------ event card */
 
+/**
+ * The clip state a card shows: the clip of the camera that was main when the event opened, or the other
+ * camera's when that one failed (an event recorded during failover has its picture in the wide clip).
+ */
+export function cardClipStatus(ev) {
+  if (!ev.clip_wide_status) return ev.clip_status;
+  const [main, other] = ev.main_camera === 'eye' ? [ev.clip_wide_status, ev.clip_status] : [ev.clip_status, ev.clip_wide_status];
+  return main === 'failed' && other && other !== 'failed' ? other : main;
+}
+
 /** Ring-style event card used by Live (recent) and History. */
 export function eventCard(ev, { onOpen, showDay = false } = {}) {
   const keys = sortCats(ev.categories);
   const day = showDay ? tsDay(ev.start_ts) : null;
   const when = fmtTime(ev.start_ts) + (day && day !== today() ? ` · ${dayLabel(day)}` : '');
-  const status = ev.clip_status === 'pending' ? 'clip processing' : ev.clip_status === 'failed' ? 'clip unavailable' : '';
+  const clip = cardClipStatus(ev);
+  const status = clip === 'pending' ? 'clip processing' : clip === 'failed' ? 'clip unavailable' : '';
   const card = h('button', {
     type: 'button',
-    class: `ev-card is-${ev.clip_status || 'ready'}`,
+    class: `ev-card is-${clip || 'ready'}`,
     'data-id': ev.id,
     'data-cat': ev.top_category,
     'aria-label': `${eventTitle(ev)} at ${when}${status ? `, ${status}` : ''}`,
@@ -230,9 +257,9 @@ export function eventCard(ev, { onOpen, showDay = false } = {}) {
   const thumb = h('span', { class: 'ev-thumb' }, h('span', { class: 'ev-ph' }, icon(ev.top_category || 'image')), img);
   img.addEventListener('error', () => thumb.classList.add('no-img'), { once: true });
   img.addEventListener('load', () => thumb.classList.add('has-img'), { once: true });
-  if (ev.clip_status === 'pending') {
+  if (clip === 'pending') {
     thumb.append(h('span', { class: 'ev-badge pending' }, h('span', { class: 'spinner xs' }), 'Processing clip…'));
-  } else if (ev.clip_status === 'failed') {
+  } else if (clip === 'failed') {
     thumb.append(h('span', { class: 'ev-badge failed' }, icon('warning'), 'No clip'));
   } else {
     thumb.append(h('span', { class: 'ev-badge' }, icon('play'), fmtDuration(ev.duration)));
@@ -247,7 +274,7 @@ export function eventCard(ev, { onOpen, showDay = false } = {}) {
 
 /** Signature of everything an event card shows; a card is rebuilt when it changes. */
 export function cardSig(ev, rev = 0) {
-  return `${ev.clip_status}|${ev.thumb_url}|${rev}|${JSON.stringify(ev.categories)}|${Math.round(ev.duration || 0)}|${ev.night ? 1 : 0}`;
+  return `${cardClipStatus(ev)}|${ev.thumb_url}|${rev}|${JSON.stringify(ev.categories)}|${Math.round(ev.duration || 0)}|${ev.night ? 1 : 0}`;
 }
 
 /* ------------------------------------------------------------------ dates and numbers */

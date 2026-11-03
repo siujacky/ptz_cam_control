@@ -76,17 +76,63 @@ export class Emitter {
   }
 }
 
-/** App-wide bus. SSE types: status, tracks, counts, event_new, event_update, event_deleted.
+/** App-wide bus. SSE types: status, tracks, counts, main, event_new, event_update, event_deleted.
  *  App types: connection, config, viewer. */
 export const bus = new Emitter();
 
 /** Latest known server state, shared by all tabs. */
+let lastMain = null; // the newest main-camera switch seen on the event stream
+
+/**
+ * Take a new status. One built just before a main-camera switch can arrive after the switch's event: until the
+ * server's status has the switch (its `since` is at least the switch's), keep the switch.
+ */
+export function takeStatus(s) {
+  const m = s?.main;
+  if (m && lastMain?.server && !(Number(m.since) >= lastMain.since)) {
+    s.main = { ...m, camera: lastMain.camera, reason: lastMain.reason, since: lastMain.since };
+  }
+  state.status = s;
+  return s;
+}
+
 export const state = {
   status: null,     // last status object (GET /api/status or SSE)
-  tracks: null,     // last SSE tracks payload
+  tracks: null,     // last SSE tracks payload of the main camera
+  tracksBy: {},     // camera ("ptz" | "eye") -> its last SSE tracks payload (both publish, ~5 Hz each)
   config: null,     // last config (GET/PUT /api/config)
   connected: false, // SSE connected
 };
+
+/* ------------------------------------------------------------------ cameras */
+// The PTZ camera and, optionally, the "eye": a fixed USB wide camera beside it. The main camera is the one
+// the live view, photos and default clips come from; failover makes the eye main while the PTZ can't see.
+
+export const EYE_ID_BASE = 2 ** 40; // track ids of the wide camera start here (ptz.EYE_ID_BASE)
+const TRACKS_STALE_MS = 3000;       // a camera that stopped publishing has nothing in view
+const tracksAt = {};
+
+/** Whether a wide camera is running (status.cameras.eye only exists while it is enabled). */
+export const hasEye = () => !!state.status?.cameras?.eye;
+
+/** The camera that is main right now. */
+export const mainCamera = () => (state.status?.main?.camera === 'eye' && hasEye() ? 'eye' : 'ptz');
+
+/** Which camera a track id belongs to. */
+export const trackCamera = (id) => (Number(id) >= EYE_ID_BASE ? 'eye' : 'ptz');
+
+/** One camera's status block ({online, fps, white, blinded, night, ...}); `camera` for a single-camera server. */
+export function cameraStatus(camera, s = state.status) {
+  if (!s) return null;
+  return s.cameras?.[camera] || (camera === 'ptz' ? s.camera : null) || null;
+}
+
+/** The latest tracks of one camera ([] when it has not published for a while). */
+export function tracksFor(camera) {
+  const p = state.tracksBy[camera];
+  if (!p || Date.now() - (tracksAt[camera] || 0) > TRACKS_STALE_MS) return [];
+  return p.tracks || [];
+}
 
 /* ------------------------------------------------------------------ media revisions */
 // Snapshots and thumbs are rewritten in place when an event improves; the URL stays the
@@ -101,7 +147,7 @@ export function mediaSrc(url, id) {
 
 /* ------------------------------------------------------------------ SSE */
 
-const SSE_TYPES = ['status', 'tracks', 'counts', 'event_new', 'event_update', 'event_deleted'];
+const SSE_TYPES = ['status', 'tracks', 'counts', 'main', 'event_new', 'event_update', 'event_deleted'];
 
 /**
  * One EventSource for the whole app. Reconnects with exponential backoff, treats a silent
@@ -165,9 +211,18 @@ export class LiveStream {
     if (!state.connected) this.setConnected(true);
     let data;
     try { data = JSON.parse(e.data); } catch { return; }
-    if (type === 'status') state.status = data;
-    else if (type === 'tracks') state.tracks = data;
-    else if (type === 'event_update' && data && data.id != null) revisions.set(data.id, mediaRev(data.id) + 1);
+    if (type === 'status') takeStatus(data);
+    else if (type === 'tracks' && data) {
+      const cam = data.camera === 'eye' ? 'eye' : 'ptz'; // a single-camera server sends no camera
+      state.tracksBy[cam] = data;
+      tracksAt[cam] = Date.now();
+      if (data.main !== false) state.tracks = data;
+    } else if (type === 'main' && data && state.status) {
+      // A main-camera switch: take it now rather than at the next status tick (up to 2 s later).
+      const server = Number(data.since) > 0; // the server's switch time (an older server sends none)
+      lastMain = { camera: data.camera, reason: data.reason, since: server ? Number(data.since) : Date.now() / 1000, server };
+      state.status.main = { ...(state.status.main || {}), camera: lastMain.camera, reason: lastMain.reason, since: lastMain.since };
+    } else if (type === 'event_update' && data && data.id != null) revisions.set(data.id, mediaRev(data.id) + 1);
     bus.emit(type, data);
   }
 

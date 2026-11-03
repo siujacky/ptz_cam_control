@@ -1,10 +1,13 @@
 // zone.js: detection-zone polygon editor over a live frame. Click / tap adds a corner,
 // corners can be dragged (or moved with the arrow keys and deleted with Delete).
 // Points are normalized [x, y] in 0..1; an empty list means "the whole frame".
-import { h, clamp } from './ui.js';
+// With a wide camera there are two zones: the PTZ Home view's (detect.zone) and the wide
+// camera's (eye.zone, where empty means automatic). Each camera keeps its own draft.
+import { h, clamp, CAM_NAME, setText } from './ui.js';
 
 const round4 = (v) => Math.round(v * 10000) / 10000;
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const CAMS = ['ptz', 'eye'];
 
 export function createZoneEditor({ onSave }) {
   const els = {
@@ -20,16 +23,23 @@ export function createZoneEditor({ onSave }) {
     clear: document.getElementById('zone-clear'),
     refresh: document.getElementById('zone-refresh'),
     save: document.getElementById('zone-save'),
+    cams: document.getElementById('zone-cams'),
+    emptyHint: document.getElementById('zone-empty-hint'),
+    counting: document.getElementById('zone-counting'),
   };
-  let pts = [];
-  let saved = [];
+  const zones = { ptz: { pts: [], saved: [] }, eye: { pts: [], saved: [] } };
+  let cam = 'ptz';           // whose zone is on screen
+  let eyeOn = false;         // a wide camera is configured
+  let pts = zones.ptz.pts;   // the points being edited (zones[cam].pts)
   let drag = null;
   let suppressClick = false;
   let frameState = 'idle'; // idle | loading | ok | error
+  let frameCam = null;     // camera of the frame on screen
   let saving = false;
 
   const norm = (list) => (Array.isArray(list) ? list : []).filter((p) => Array.isArray(p) && p.length === 2).map(([x, y]) => [round4(Number(x)), round4(Number(y))]);
-  const dirty = () => !same(norm(pts), norm(saved));
+  const dirtyOf = (c) => !same(norm(zones[c].pts), norm(zones[c].saved));
+  const dirty = () => dirtyOf(cam);
   const valid = () => pts.length === 0 || pts.length >= 3;
 
   /** Pointer position -> normalized image coordinates (handles object-fit letterboxing). */
@@ -66,7 +76,7 @@ export function createZoneEditor({ onSave }) {
     });
 
     const isDirty = dirty();
-    let pill = 'Whole frame';
+    let pill = cam === 'eye' ? 'Automatic' : 'Whole frame';
     let cls = '';
     if (pts.length && !valid()) { pill = `Add ${3 - pts.length} more corner${pts.length === 2 ? '' : 's'}`; cls = 'is-warn'; }
     else if (isDirty) { pill = 'Unsaved'; cls = 'is-accent'; }
@@ -76,13 +86,29 @@ export function createZoneEditor({ onSave }) {
     els.undo.disabled = !pts.length;
     els.clear.disabled = !pts.length;
     els.save.disabled = saving || !isDirty || !valid();
+    renderCams();
+  }
+
+  function renderCams() {
+    els.cams.hidden = !eyeOn;
+    for (const b of els.cams.querySelectorAll('button[data-cam]')) {
+      const c = b.dataset.cam;
+      b.setAttribute('aria-pressed', String(c === cam));
+      b.title = dirtyOf(c) && c !== cam ? 'Unsaved changes' : '';
+    }
+    els.emptyHint.textContent = cam === 'eye'
+      ? "No zone on the wide camera means automatic: it counts in the PTZ Home view's area (and its zone) once the cameras are synced."
+      : 'No zone means the whole frame.';
+    els.img.alt = cam === 'eye' ? 'Current wide camera frame for drawing its detection zone' : 'Current camera frame for drawing the detection zone';
   }
 
   function loadFrame() {
     frameState = 'loading';
+    frameCam = cam;
     els.stage.classList.add('is-loading');
     els.msg.hidden = true;
-    els.img.src = `/api/frame.jpg?overlay=0&width=1280&_=${Date.now()}`;
+    // Always name the camera: the default (the main camera) can be the wide one during a failover.
+    els.img.src = `/api/frame.jpg?camera=${cam}&overlay=0&width=1280&_=${Date.now()}`;
   }
 
   els.img.addEventListener('load', () => {
@@ -153,34 +179,72 @@ export function createZoneEditor({ onSave }) {
   });
 
   els.undo.addEventListener('click', () => { pts.pop(); render(); });
-  els.clear.addEventListener('click', () => { pts = []; render(); });
+  els.clear.addEventListener('click', () => { pts.length = 0; render(); });
   els.refresh.addEventListener('click', loadFrame);
   els.save.addEventListener('click', async () => {
     if (!valid() || !dirty()) return;
+    const which = cam;
     saving = true;
     render();
     try {
-      const result = await onSave(norm(pts));
-      if (result) setSaved(result, true);
+      const result = await onSave(norm(zones[which].pts), which);
+      if (result) setSaved(result, true, which);
     } finally {
       saving = false;
       render();
     }
   });
+  els.cams.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-cam]');
+    if (b) setCamera(b.dataset.cam);
+  });
 
-  /** New saved zone from the server. Keeps unsaved edits unless `force`. */
-  function setSaved(zone, force = false) {
-    const wasDirty = dirty();
-    saved = norm(zone);
-    if (force || !wasDirty) pts = saved.map((p) => p.slice());
+  /** New saved zone from the server for one camera. Keeps unsaved edits unless `force`. */
+  function setSaved(zone, force = false, which = 'ptz') {
+    const z = zones[which];
+    const wasDirty = dirtyOf(which);
+    z.saved = norm(zone);
+    if (force || !wasDirty) {
+      z.pts = z.saved.map((p) => p.slice());
+      if (which === cam) pts = z.pts;
+    }
     render();
+  }
+
+  /** Show and edit another camera's zone; its draft and frame come back with it. */
+  function setCamera(next) {
+    const c = CAMS.includes(next) && (next === 'ptz' || eyeOn) ? next : 'ptz';
+    if (c === cam) return;
+    drag = null;
+    cam = c;
+    pts = zones[c].pts;
+    els.handles.replaceChildren(); // corners of the other camera's zone
+    render();
+    if (frameState !== 'idle') loadFrame();
   }
 
   render();
   return {
     setSaved,
-    isDirty: dirty,
-    activate() { if (frameState === 'idle' || frameState === 'error') loadFrame(); },
+    setCamera,
+    /** Whether a wide camera is configured: shows the camera choice (back to the PTZ zone when not). */
+    setEyeEnabled(on) {
+      eyeOn = !!on;
+      if (!eyeOn) setCamera('ptz');
+      render();
+    },
+    /** Which camera counts right now ("ptz" | "eye"), for the line under the choice. */
+    setCounting(which) {
+      const show = eyeOn && CAMS.includes(which);
+      els.counting.hidden = !show;
+      if (show) {
+        setText(els.counting, which === 'eye' // aria-live, and this runs on every status
+          ? 'The wide camera counts passers-by right now.'
+          : `The ${CAM_NAME.ptz} counts passers-by right now, on its Home view.`);
+      }
+    },
+    isDirty: () => CAMS.some(dirtyOf),
+    activate() { if (frameState === 'idle' || frameState === 'error' || frameCam !== cam) loadFrame(); },
     reloadFrame: loadFrame,
   };
 }

@@ -61,13 +61,25 @@
               <span id="stage-msg-text">Trying to reconnect…</span>
             </div>
             <div class="stage-top">
-              <span class="live-badge" id="live-badge"><span class="live-dot" aria-hidden="true"></span><span id="live-badge-text">Live</span><span class="live-fps" id="live-fps"></span></span>
-              <span class="night-badge" id="night-badge" hidden title="Night vision: the AI HAT brightens the dark picture (Zero-DCE)"><i data-icon="moon"></i>Night vision</span>
-              <span class="night-badge bright-badge" id="bright-badge" hidden><i data-icon="sun"></i><span id="bright-badge-text">Auto brightness</span></span>
-              <span class="stage-spacer"></span>
-              <button class="icon-btn glass" id="btn-overlay" type="button" aria-pressed="true" title="Detection boxes"><i data-icon="boxes"></i><span class="sr-only">Detection boxes</span></button>
-              <button class="icon-btn glass" id="btn-fullscreen" type="button" title="Fullscreen"><i data-icon="expand"></i><span class="sr-only" id="fs-label">Enter fullscreen</span></button>
+              <div class="stage-row">
+                <span class="live-badge" id="live-badge"><span class="live-dot" aria-hidden="true"></span><span id="live-badge-text">Live</span><span class="live-fps" id="live-fps"></span></span>
+                <span class="night-badge" id="night-badge" hidden title="Night vision: the AI HAT brightens the dark picture (Zero-DCE)"><i data-icon="moon"></i>Night vision</span>
+                <span class="night-badge bright-badge" id="bright-badge" hidden><i data-icon="sun"></i><span id="bright-badge-text">Auto brightness</span></span>
+                <span class="stage-spacer"></span>
+                <button class="icon-btn glass" id="btn-overlay" type="button" aria-pressed="true" title="Detection boxes"><i data-icon="boxes"></i><span class="sr-only">Detection boxes</span></button>
+                <button class="icon-btn glass" id="btn-fullscreen" type="button" title="Fullscreen"><i data-icon="expand"></i><span class="sr-only" id="fs-label">Enter fullscreen</span></button>
+              </div>
+              <span class="sr-only" id="cam-announce" aria-live="polite"></span>
+              <div class="stage-cam" id="stage-cam" hidden>
+                <span class="night-badge cam-badge" id="cam-badge" hidden><i data-icon="wide"></i><span id="cam-badge-text">Wide camera</span></span>
+                <button class="cam-auto" id="btn-cam-auto" type="button" hidden><span class="cam-auto-pill"><i data-icon="undo"></i>Auto</span></button>
+              </div>
             </div>
+            <button class="pip" id="pip" type="button" aria-label="Show the wide camera in the big view" title="Swap: show the wide camera big" hidden>
+              <img class="pip-img" id="pip-img" alt="" decoding="async">
+              <span class="pip-swap" aria-hidden="true"><i data-icon="swap"></i></span>
+              <span class="pip-label" id="pip-label">Wide camera</span>
+            </button>
             <div class="stage-toast" id="stage-toast" aria-hidden="true" hidden></div>
           </div>
           <div class="live-status">
@@ -343,7 +355,7 @@
               <input type="text" id="f-name" data-path="camera.name" data-type="string" maxlength="40" autocomplete="off" spellcheck="false">
             </div>
             <details class="advanced">
-              <summary>Advanced: stream and PTZ connection</summary>
+              <summary>Advanced: stream, PTZ and USB connection</summary>
               <div class="field">
                 <label for="f-rtsp">RTSP URL</label>
                 <input type="text" id="f-rtsp" data-path="camera.rtsp_url" data-type="string" inputmode="url" autocomplete="off" spellcheck="false">
@@ -359,7 +371,56 @@
                   <input type="number" inputmode="numeric" id="f-vport" data-path="camera.visca_port" data-type="int" min="1" max="65535" step="1">
                 </div>
               </div>
+              <div class="field-pair stack-sm">
+                <div class="field">
+                  <label for="f-usb">USB name</label>
+                  <input type="text" id="f-usb" data-path="camera.usb_device" data-type="string" placeholder="Not connected" autocomplete="off" spellcheck="false" aria-describedby="usb-hint">
+                </div>
+                <div class="field">
+                  <label for="f-flicker">Anti-flicker</label>
+                  <span class="select-wrap"><select id="f-flicker" data-path="camera.anti_flicker" data-type="int" aria-describedby="usb-hint">
+                    <option value="-1">Leave as it is</option>
+                    <option value="0">Off</option>
+                    <option value="1">50 Hz</option>
+                    <option value="2">60 Hz</option>
+                  </select></span>
+                </div>
+              </div>
+              <p class="hint" id="usb-hint">If the PTZ camera is also plugged into the Pi by USB, enter part of its name (e.g. Unite 200). The camera forgets its anti-flicker setting when it restarts; the app puts it back. Leave the name empty if there is no USB cable.</p>
             </details>
+          </section>
+
+          <section class="card s-failover" aria-labelledby="s-failover-title">
+            <div class="card-head">
+              <h2 class="card-title" id="s-failover-title">Failover</h2>
+              <span class="pill is-muted" id="failover-pill">Off</span>
+            </div>
+            <div class="field">
+              <label for="f-fo-mode">Main camera</label>
+              <span class="select-wrap"><select id="f-fo-mode" data-path="failover.mode" data-type="string" aria-describedby="fo-mode-hint">
+                <option value="auto">Automatic</option>
+                <option value="ptz">Always the PTZ camera</option>
+                <option value="eye">Always the wide camera</option>
+              </select></span>
+              <p class="hint" id="fo-mode-hint">The live view, event photos and the first clip in each event come from the main camera. Automatic uses the PTZ camera, and hands over to the wide camera while the sun washes out the PTZ picture or the PTZ is offline.</p>
+            </div>
+            <div class="range-field">
+              <div class="field-top"><label for="f-fo-white">Washed out at</label><output data-out="failover.white"></output></div>
+              <input type="range" id="f-fo-white" data-path="failover.white" data-type="float" data-format="pct" min="0.05" max="1" step="0.05" aria-describedby="fo-white-hint">
+              <p class="hint" id="fo-white-hint">How much of the PTZ picture must be burnt white. A blinded picture hands over within seconds.</p>
+            </div>
+            <div class="field-pair">
+              <div class="field">
+                <label for="f-fo-switch">Switch after</label>
+                <span class="input-unit"><input type="number" inputmode="numeric" id="f-fo-switch" data-path="failover.switch_after" data-type="float" min="0" max="3600" step="1" aria-describedby="fo-time-hint"><span>s</span></span>
+              </div>
+              <div class="field">
+                <label for="f-fo-return">Return after</label>
+                <span class="input-unit"><input type="number" inputmode="numeric" id="f-fo-return" data-path="failover.return_after" data-type="float" min="0" max="86400" step="1" aria-describedby="fo-time-hint"><span>s</span></span>
+              </div>
+            </div>
+            <p class="hint" id="fo-time-hint">Switch: how long the PTZ must stay washed out before the wide camera takes over. Return: how long its picture must stay clear before it gets the view back, so a passing cloud doesn't flip the view.</p>
+            <p class="hint" id="failover-status" aria-live="polite"></p>
           </section>
         </div>
 
@@ -369,7 +430,12 @@
               <h2 class="card-title" id="s-zone-title">Detection zone</h2>
               <span class="pill" id="zone-pill">Whole frame</span>
             </div>
-            <p class="hint">Click or tap the frame to add corners, drag a corner to move it. Objects count only when their feet enter the zone. No zone means the whole frame.</p>
+            <div class="seg sm zone-cams" id="zone-cams" role="group" aria-label="Draw the zone on" hidden>
+              <button type="button" data-cam="ptz" aria-pressed="true"><i data-icon="home"></i>PTZ Home view</button>
+              <button type="button" data-cam="eye" aria-pressed="false"><i data-icon="wide"></i>Wide camera</button>
+            </div>
+            <p class="hint">Click or tap the frame to add corners, drag a corner to move it. Objects count only when their feet enter the zone. <span id="zone-empty-hint">No zone means the whole frame.</span></p>
+            <p class="hint" id="zone-counting" aria-live="polite" hidden></p>
             <div class="zone-stage" id="zone-stage">
               <img class="zone-img" id="zone-img" alt="Current camera frame for drawing the detection zone">
               <svg class="zone-svg" id="zone-svg" viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true">
@@ -438,6 +504,91 @@
             </div>
           </section>
 
+          <section class="card s-eye" aria-labelledby="s-eye-title">
+            <div class="card-head">
+              <h2 class="card-title" id="s-eye-title">Wide camera</h2>
+              <span class="pill is-muted" id="eye-pill">Off</span>
+            </div>
+            <p class="hint">A fixed USB camera beside the PTZ camera. Its view never moves, so it keeps counting while the PTZ follows someone, and it can show the PTZ where to look.</p>
+            <label class="switch-row">
+              <span class="switch-text"><span class="switch-title">Use the wide camera</span><span class="switch-sub">Turning it on or off restarts detection for a few seconds</span></span>
+              <input type="checkbox" role="switch" class="switch" id="f-eye-enabled" data-path="eye.enabled" data-type="bool">
+            </label>
+            <div class="field-pair stack-sm">
+              <div class="field">
+                <label for="f-eye-name">Name</label>
+                <input type="text" id="f-eye-name" data-path="eye.name" data-type="string" maxlength="40" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="field">
+                <label for="f-eye-device">USB camera</label>
+                <input type="text" id="f-eye-device" data-path="eye.device" data-type="string" autocomplete="off" spellcheck="false" aria-describedby="eye-device-hint">
+              </div>
+            </div>
+            <p class="hint" id="eye-device-hint">Part of the camera's name as the Pi lists it (e.g. Avaya HC020), or a /dev/v4l/by-id/ path. Changing it restarts detection.</p>
+            <label class="switch-row">
+              <span class="switch-text"><span class="switch-title">Count on the wide camera</span><span class="switch-sub">Counting never pauses while the PTZ moves. It uses the wide camera's zone, or the PTZ Home view's area once the cameras are synced; until then the PTZ counts. Nobody is counted twice when counting moves between the cameras</span></span>
+              <input type="checkbox" role="switch" class="switch" id="f-eye-count" data-path="eye.count" data-type="bool">
+            </label>
+            <label class="switch-row">
+              <span class="switch-text"><span class="switch-title">Wide camera steers the PTZ</span><span class="switch-sub">With auto-follow on, the wide camera picks who to follow (in the counting zone) and points the PTZ at them, even outside the PTZ's view. The photo then comes from the PTZ's close-up. Needs the camera sync</span></span>
+              <input type="checkbox" role="switch" class="switch" id="f-eye-follow" data-path="eye.follow" data-type="bool">
+            </label>
+            <div class="field">
+              <label for="f-eye-clips">Wide clips</label>
+              <span class="select-wrap"><select id="f-eye-clips" data-path="eye.clips" data-type="string" aria-describedby="eye-clips-hint">
+                <option value="auto">Only when they add something</option>
+                <option value="always">For every event</option>
+                <option value="never">Never</option>
+              </select></span>
+              <p class="hint" id="eye-clips-hint">Every event keeps the PTZ camera's clip. "Only when they add something" keeps the wide clip when, during the event, the PTZ moved, followed someone or was offline, the wide camera was main, or the PTZ's own clip failed. Otherwise it shows the same scene and only costs storage.</p>
+            </div>
+            <div class="field">
+              <label for="f-eye-flicker">Anti-flicker</label>
+              <span class="select-wrap"><select id="f-eye-flicker" data-path="eye.anti_flicker" data-type="int" aria-describedby="eye-flicker-hint">
+                <option value="-1">Leave as it is</option>
+                <option value="0">Off</option>
+                <option value="1">50 Hz</option>
+                <option value="2">60 Hz</option>
+              </select></span>
+              <p class="hint" id="eye-flicker-hint">If lamps flicker or roll through the picture, match your mains: 50 Hz in most of the world, 60 Hz in the Americas. Applied at once, and put back whenever the camera resets it.</p>
+            </div>
+            <p class="hint" id="eye-status" aria-live="polite"></p>
+            <div class="sync-box">
+              <div class="field-top"><span id="sync-label">Camera sync</span><span class="pill" id="sync-pill">–</span></div>
+              <p class="hint" id="sync-status" aria-live="polite"></p>
+              <p class="hint" id="sync-how">The sync tells the PTZ where to point for any spot in the wide picture. Measure it once in daylight with the app stopped (about 3 minutes; the PTZ sweeps its whole view), and again whenever either camera is moved. In the app's folder on the Pi, run:</p>
+              <div class="cmd">
+                <code class="cmd-text" id="sync-cmd">sudo systemctl stop ptzcam
+.venv/bin/python tools/calibrate_sync.py
+sudo systemctl start ptzcam</code>
+                <button type="button" class="btn btn-sm" id="sync-copy"><i data-icon="copy"></i>Copy commands</button>
+              </div>
+              <p class="hint" id="sync-auto-how">Or let the Pi do it by itself at the next clear daytime moment (it waits until both pictures have been clear for 10 minutes, then stops the app for those 3 minutes; Settings shows its progress here):</p>
+              <div class="cmd">
+                <code class="cmd-text" id="sync-auto-cmd">sudo systemd-run --unit=ptzcam-sync-once /home/pi/ptz_cam/.venv/bin/python /home/pi/ptz_cam/tools/sync_when_clear.py</code>
+                <button type="button" class="btn btn-sm" id="sync-auto-copy"><i data-icon="copy"></i>Copy command</button>
+              </div>
+            </div>
+            <details class="advanced">
+              <summary>Advanced: picture size</summary>
+              <div class="field-pair">
+                <div class="field">
+                  <label for="f-eye-w">Width</label>
+                  <span class="input-unit"><input type="number" inputmode="numeric" id="f-eye-w" data-path="eye.width" data-type="int" min="320" max="1920" step="1"><span>px</span></span>
+                </div>
+                <div class="field">
+                  <label for="f-eye-h">Height</label>
+                  <span class="input-unit"><input type="number" inputmode="numeric" id="f-eye-h" data-path="eye.height" data-type="int" min="180" max="1080" step="1"><span>px</span></span>
+                </div>
+              </div>
+              <div class="field">
+                <label for="f-eye-fps">Frame rate</label>
+                <span class="input-unit"><input type="number" inputmode="numeric" id="f-eye-fps" data-path="eye.fps" data-type="int" min="5" max="30" step="1"><span>fps</span></span>
+              </div>
+              <p class="hint">Use a mode the camera offers, such as 1920 × 1080 or 1280 × 720 at 15 fps. Changing these restarts detection; measure the sync again after changing the size.</p>
+            </details>
+          </section>
+
           <section class="card s-sys" aria-labelledby="s-sys-title">
             <div class="card-head">
               <h2 class="card-title" id="s-sys-title">System</h2>
@@ -481,6 +632,10 @@
           <div class="seg sm" role="group" aria-label="Show">
             <button type="button" id="vm-video" aria-pressed="true"><i data-icon="video"></i>Video</button>
             <button type="button" id="vm-snap" aria-pressed="false"><i data-icon="image"></i>Snapshot</button>
+          </div>
+          <div class="seg sm cam-seg" id="vm-cam" role="group" aria-label="Camera" hidden>
+            <button type="button" id="vm-cam-ptz" data-cam="ptz" aria-pressed="true"><i data-icon="zoom"></i>Close-up</button>
+            <button type="button" id="vm-cam-eye" data-cam="eye" aria-pressed="false"><i data-icon="wide"></i>Wide</button>
           </div>
           <button type="button" class="btn btn-sm night-toggle" id="vm-night" aria-pressed="true" hidden title="Switch between the night-vision clip and the camera's original"><i data-icon="moon"></i>Night vision</button>
         </div>

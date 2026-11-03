@@ -1,8 +1,8 @@
 // ptz.js: PTZ pad: press-and-hold pan/tilt and zoom (repeated every 400 ms while held,
 // stopped on release), presets with a Save mode, auto-follow / auto-zoom switches,
 // click-to-follow and the human-readable PTZ status line.
-import { api, bus, state } from './api.js';
-import { CAT, h, icon, toast, store } from './ui.js';
+import { api, bus, state, hasEye, trackCamera, tracksFor } from './api.js';
+import { CAT, h, icon, toast, store, trackNo } from './ui.js';
 
 const REPEAT_MS = 400;
 const VISCA_ZOOM_MAX = 16384;
@@ -188,24 +188,31 @@ export function zoomText(p) {
   return '';
 }
 
-/** One-line PTZ state, e.g. "Following person #12 · zoom 37%" or "Watching (wide)". */
+/**
+ * One-line PTZ state, e.g. "Following person #12 · zoom 37%" or "Watching (wide)". When the wide camera
+ * picks the target and aims the PTZ (ptz.mode "eye"), the line says so.
+ */
 export function ptzLine(p) {
   if (!p) return 'Connecting…';
   if (!p.enabled) return 'PTZ disabled in settings';
   if (!p.connected) return 'PTZ not connected';
   const z = zoomText(p);
   const tail = z ? ` · ${z}` : '';
+  const eyeAims = p.mode === 'eye';
   if (p.autotrack) {
     if (p.paused_for > 0) return `Auto-follow paused while you steer · resumes in ${Math.ceil(p.paused_for)} s`;
     if (p.target_id != null) {
-      const t = state.tracks?.tracks?.find((x) => x.id === p.target_id);
+      const t = tracksFor(trackCamera(p.target_id)).find((x) => x.id === p.target_id);
       const what = t ? (CAT[t.category]?.label || t.label || 'object').toLowerCase() : 'object';
-      return `Following ${what} #${p.target_id}${tail}`;
+      return `Following ${what} #${trackNo(p.target_id)}${eyeAims ? ' · aimed by the wide camera' : ''}${tail}`;
     }
-    return `Auto-follow on · waiting for a moving object${tail}`;
+    return eyeAims
+      ? `Auto-follow on · the wide camera is looking for a moving object${tail}`
+      : `Auto-follow on · waiting for a moving object${tail}`;
   }
   if (p.moving) return `Moving${tail}`;
-  return z ? `Watching${tail}` : 'Watching (wide)';
+  if (z) return `Watching${tail}`;
+  return hasEye() ? 'Watching (zoomed out)' : 'Watching (wide)'; // "wide" would read as the wide camera
 }
 
 function pillState(p) {
@@ -246,7 +253,7 @@ export function renderStatus(status) {
 
 /* ------------------------------------------------------------------ actions */
 
-/** Lock auto-follow onto a track picked in the live view. */
+/** Lock auto-follow onto a track picked in the live view (either camera's: the ids do not overlap). */
 export async function followTrack(track) {
   if (!usable()) {
     toast('Camera control is unavailable right now', { type: 'error' });
@@ -256,7 +263,7 @@ export async function followTrack(track) {
   try {
     const res = await api.post('/api/ptz/autotrack', { enabled: true, track_id: track.id });
     patchPtz({ autotrack: !!res?.autotrack, target_id: res?.target_id ?? track.id });
-    toast(`Following ${what} #${track.id}`, { type: 'success' });
+    toast(`Following ${what} #${trackNo(track.id)}`, { type: 'success' });
   } catch (err) {
     toast(`Couldn't follow that ${what}: ${err.message}`, { type: 'error' });
   }
