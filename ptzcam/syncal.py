@@ -19,16 +19,27 @@ MIN_INLIERS = 25
 PROBE_PAN, PROBE_TILT = 150, 80  # first small moves, to learn which way the eye's coordinates run
 
 
-def _prep(img: np.ndarray, width: int) -> np.ndarray:
+def _prep(img: np.ndarray, width: int, blur: float = 0.0) -> np.ndarray:
     h, w = img.shape[:2]
     g = cv2.cvtColor(cv2.resize(img, (width, round(h * width / w)), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    if blur:
+        g = cv2.GaussianBlur(g, (0, 0), blur)
     return cv2.createCLAHE(2.0, (8, 8)).apply(g)  # the two cameras expose and colour the same scene differently
 
 
 def match_views(ptz_img: np.ndarray, eye_img: np.ndarray, min_inliers: int = MIN_INLIERS):
     """Where the PTZ's picture lies in the eye's: (u, v, fw, fh, inliers), all fractions of the eye frame (centre,
-    width, height), or None when the pictures don't match well enough."""
-    a, b = _prep(ptz_img, MATCH_PTZ_W), _prep(eye_img, MATCH_EYE_W)
+    width, height), or None when the pictures don't match well enough. If the sharp pictures do not match, they are
+    tried again lightly blurred: the fly screen in front of the PTZ adds a fine grid of features of its own."""
+    for blur in (0.0, 1.5):
+        m = _match(ptz_img, eye_img, min_inliers, blur)
+        if m is not None:
+            return m
+    return None
+
+
+def _match(ptz_img, eye_img, min_inliers, blur):
+    a, b = _prep(ptz_img, MATCH_PTZ_W, blur), _prep(eye_img, MATCH_EYE_W, blur)
     sift = cv2.SIFT_create(4000)
     ka, da = sift.detectAndCompute(a, None)
     kb, db = sift.detectAndCompute(b, None)

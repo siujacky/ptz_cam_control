@@ -391,9 +391,10 @@ function scheduledText(p) {
   if (p.state === 'waiting') {
     const need = Math.round((Number(p.need) || 600) / 60);
     const clear = Math.floor((Number(p.clear_for) || 0) / 60);
-    return clear > 0
+    const text = clear > 0
       ? `An automatic sync is waiting: both pictures clear for ${clear} of the ${need} minutes it needs.`
       : `An automatic sync is waiting for both pictures to be clear for ${need} minutes in daylight.`;
+    return p.error ? `${text} (Its last try did not finish: ${p.error}; it tries again.)` : text;
   }
   if (p.state === 'syncing') return 'Syncing the cameras now.';
   if (p.state === 'failed') return `The automatic sync did not finish: ${p.error || 'see its log'}.`;

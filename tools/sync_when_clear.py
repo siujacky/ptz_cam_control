@@ -20,6 +20,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 STEADY_S = 10 * 60
 MAX_WAIT_S = 48 * 3600
+ATTEMPTS = 3  # a failed calibration (the PTZ dropped off the network, a cloud mid-sweep) is tried again...
+RETRY_GAP_S = 30 * 60  # ...after this, at the next clear moment
 HOURS = (7, 16)  # local hours in which the street is lit but the sun is not yet low in the window
 POLL_S = 30
 
@@ -34,6 +36,7 @@ def data_dir() -> Path:
 
 PENDING = data_dir() / "sync_pending.json"
 STARTED = time.time()
+LAST_ERROR = None  # why the previous attempt stopped, shown while waiting for the next
 
 
 def report(state: str, **extra):
@@ -58,8 +61,10 @@ def status():
         return json.load(r)
 
 
-def main():
-    start, since = time.time(), None
+def wait_until_clear(start):
+    """Until both pictures have been clear for STEADY_S inside HOURS. Returns the time they became clear, or None
+    when MAX_WAIT_S (from `start`) ran out."""
+    since = None
     while time.time() - start < MAX_WAIT_S:
         try:
             cams = status().get("cameras", {})
@@ -70,14 +75,14 @@ def main():
             ok = False
         since = (since or time.time()) if ok else None
         if since is not None and time.time() - since >= STEADY_S:
-            break
-        report("waiting", clear_for=round(time.time() - since) if since is not None else 0)
+            return since
+        report("waiting", clear_for=round(time.time() - since) if since is not None else 0, error=LAST_ERROR)
         time.sleep(POLL_S)
-    else:
-        report("failed", error=f"the pictures were never clear for {STEADY_S // 60} minutes in "
-                               f"{MAX_WAIT_S // 3600} hours")
-        sys.exit("never clear for long enough: nothing done")
-    print(f"clear since {time.strftime('%H:%M', time.localtime(since))}: syncing the cameras", flush=True)
+    return None
+
+
+def calibrate() -> int:
+    """Stop the app, run the calibration, start the app again whatever happened. Returns its exit code."""
     report("syncing")
     r = None
     try:
@@ -85,14 +90,35 @@ def main():
         r = subprocess.run([str(ROOT / ".venv/bin/python"), str(ROOT / "tools/calibrate_sync.py")], cwd=ROOT)
         print(f"calibration exit code {r.returncode}", flush=True)
     finally:
-        if r is not None and r.returncode == 0:
-            PENDING.unlink(missing_ok=True)
-        else:
-            report("failed", error=f"the calibration stopped (exit code {r.returncode if r else 'none'}); "
-                                   "see journalctl -u ptzcam-sync-once")
         subprocess.run(["rm", "-rf", str(ROOT / "ptzcam" / "__pycache__")])
         subprocess.run(["systemctl", "start", "ptzcam"], check=False)
-    sys.exit(r.returncode)
+    return r.returncode if r is not None else -1
+
+
+def main():
+    global LAST_ERROR
+    start = time.time()
+    for attempt in range(1, ATTEMPTS + 1):
+        since = wait_until_clear(start)
+        if since is None:
+            report("failed", error=f"the pictures were never clear for {STEADY_S // 60} minutes in "
+                                   f"{MAX_WAIT_S // 3600} hours")
+            sys.exit("never clear for long enough: nothing done")
+        print(f"clear since {time.strftime('%H:%M', time.localtime(since))}: syncing the cameras "
+              f"(attempt {attempt} of {ATTEMPTS})", flush=True)
+        code = calibrate()
+        if code == 0:
+            PENDING.unlink(missing_ok=True)
+            sys.exit(0)
+        if attempt == ATTEMPTS:
+            report("failed", error=f"the calibration stopped {ATTEMPTS} times (last exit code {code}); "
+                                   "see journalctl -u ptzcam-sync-once")
+            sys.exit(code)
+        LAST_ERROR = f"attempt {attempt} of {ATTEMPTS} stopped (exit code {code})"
+        until = time.time() + RETRY_GAP_S
+        while time.time() < until:  # keep the progress fresh (the app drops it after 10 minutes without news)
+            report("waiting", clear_for=0, error=LAST_ERROR)
+            time.sleep(POLL_S)
 
 
 if __name__ == "__main__":
