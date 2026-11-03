@@ -30,6 +30,10 @@ ZOOM_RATIO = 12.0        # assumed magnification at full zoom, growing exponenti
 ZOOM_RATE = 8000.0       # assumed zoom-direct speed (positions per second) until measured
 ZOOM_ARRIVED = 64        # a zoom position this close to the goal has arrived
 ZOOM_GOAL_TIMEOUT_S = 4.0
+PT_RATE = 250.0          # pan/tilt units per second at full absolute-move speed (300 units took 1.7 s at 2/3 speed)
+PT_ARRIVED = 4           # a pan/tilt position this close to the goal has arrived
+PT_GOAL_SLACK_S = 2.0    # give up waiting for arrival this long after the predicted travel time
+PT_RETRY_S = 0.3         # an absolute move the camera could not take yet (busy) is retried after this
 
 FOLLOW_WEIGHT = {"person": 3.0, "animal": 2.5, "motorcycle": 2.0, "bicycle": 2.0, "vehicle": 1.0}
 # A rider and their bike can be detected as either; losing one and finding the other close by is the same target.
@@ -192,7 +196,16 @@ class PTZController:
         self.tilt_pos = None
         self.zoom_goal = None  # the last absolute zoom sent (zoom_to)
         self._zoom_goal_t = 0.0
+        self._want_abs = None  # (pan, tilt, vv, ww): the newest absolute pan/tilt goal, replaced, never queued
+        self._sent_abs = None
+        self._abs_retry = 0.0
+        self._abs_supported = True
+        self.pt_goal = None  # the last absolute pan/tilt goal (pan_tilt_to)
+        self._pt_goal_t = 0.0
+        self._pt_from = None  # pose when that goal was set, for pose_estimate()
+        self._pt_travel = 0.0
         self.home_zoom = None  # zoom position read while resting at Home
+        self.home_pan = self.home_tilt = None
         self.at_home = False  # unknown until the startup check (_check_home)
         self.last_motion_ts = 0.0
         self.motion_until = 0.0
@@ -244,6 +257,7 @@ class PTZController:
             if pd == 3 and td == 3:
                 self._want_pt = STOP
             else:
+                self._cancel_abs()  # a drive takes over from an absolute move on the camera too
                 self._want_pt = (vv, ww, pd, td)
                 self._pt_deadline = time.monotonic() + hold
                 self.at_home = False
@@ -252,14 +266,72 @@ class PTZController:
 
     def stop_pantilt(self):
         with self._cond:
+            self._cancel_abs(stop_camera=True)
             self._want_pt = STOP
             self._cond.notify()
 
     def stop(self):
         with self._cond:
+            self._cancel_abs(stop_camera=True)
             self._want_pt = STOP
             self._want_zoom = 0
             self._cond.notify()
+
+    def _cancel_abs(self, stop_camera: bool = False):
+        """Drop any absolute pan/tilt goal (call with the lock held). `stop_camera`: one may still be travelling on
+        the camera, so make the worker send a pan/tilt stop even though no drive was sent."""
+        if stop_camera and (self._sent_abs is not None or self._want_abs is not None) and not self.pt_arrived:
+            self._sent_pt = None
+        self._want_abs = self._sent_abs = None
+        self.pt_goal = None
+
+    def pan_tilt_to(self, pan: int, tilt: int, speed: float = 1.0) -> bool:
+        """Absolute pan/tilt (VISCA 01 06 02): the camera drives there itself and stops. A newer goal replaces one not
+        yet sent, so a stream of goals never queues. Returns False when this camera or link cannot do it."""
+        if not self.can_point:
+            return False
+        s = min(max(speed, 0.05), 1.0)
+        vv, ww = max(1, round(s * PAN_MAX)), max(1, round(s * TILT_MAX))
+        rate = (self.cfg.data["ptz"].get("pt_rate") or PT_RATE) * s
+        with self._cond:
+            cur = self.pose_estimate()
+            travel = max(abs(pan - cur[0]), abs(tilt - cur[1])) / rate + 0.3 if cur else 1.5
+            self._want_pt = STOP
+            self._want_abs = (int(pan), int(tilt), vv, ww)
+            self.pt_goal, self._pt_goal_t = (int(pan), int(tilt)), time.monotonic()
+            self._pt_from, self._pt_travel = cur, travel
+            self._next_poll = 0.0  # an idle camera polls every 10 s: start watching for arrival now
+            self.at_home = False
+            self.last_motion_ts = time.time()
+            self.motion_until = max(self.motion_until, time.time() + travel)  # counting on this camera pauses
+            self._cond.notify()
+        return True
+
+    @property
+    def can_point(self) -> bool:
+        """Absolute pan/tilt is possible now: VISCA is up, the camera accepts it, and the pose is known."""
+        return self.enabled and self._visca_ok and self._abs_supported and self.pan_pos is not None
+
+    @property
+    def pt_arrived(self) -> bool:
+        """The last pan_tilt_to has finished: the pose reads back at the goal, or it is overdue."""
+        if self.pt_goal is None:
+            return True
+        if time.monotonic() - self._pt_goal_t > self._pt_travel + PT_GOAL_SLACK_S:
+            return True
+        return (self.pan_pos is not None and abs(self.pan_pos - self.pt_goal[0]) <= PT_ARRIVED
+                and abs(self.tilt_pos - self.pt_goal[1]) <= PT_ARRIVED)
+
+    def pose_estimate(self):
+        """Best guess of (pan, tilt) now. Position readings lag about a second while moving, so during an absolute
+        move this interpolates from the pose at the command to the goal over the predicted travel time."""
+        if self.pt_goal is not None and self._pt_from is not None and not self.pt_arrived:
+            f = min(1.0, (time.monotonic() - self._pt_goal_t) / max(self._pt_travel, 1e-3))
+            return (self._pt_from[0] + (self.pt_goal[0] - self._pt_from[0]) * f,
+                    self._pt_from[1] + (self.pt_goal[1] - self._pt_from[1]) * f)
+        if self.pan_pos is None:
+            return None
+        return float(self.pan_pos), float(self.tilt_pos)
 
     def zoom(self, direction: str, speed: float = 0.5, hold: float = 1.0):
         if not self.enabled:
@@ -285,6 +357,7 @@ class PTZController:
             self._want_zoom = 0
             self._enqueue("zoom_to", pos)
             self.zoom_goal, self._zoom_goal_t = pos, time.monotonic()
+            self._next_poll = 0.0  # an idle camera polls every 10 s: start watching for arrival now
             self.at_home = False
             self.last_motion_ts = time.time()
             self.motion_until = max(self.motion_until, time.time() + travel)  # counting pauses meanwhile
@@ -302,6 +375,7 @@ class PTZController:
             return
         hp = self.cfg.data["ptz"]["home_preset"]
         with self._cond:
+            self._cancel_abs(stop_camera=True)
             self._want_pt, self._want_zoom = STOP, 0
             if hp:
                 self._enqueue("preset_call", hp)
@@ -317,6 +391,7 @@ class PTZController:
             return
         with self._cond:
             if action == "call":
+                self._cancel_abs(stop_camera=True)
                 self._want_pt, self._want_zoom = STOP, 0
                 self._enqueue("preset_call", n)
                 hp = self.cfg.data["ptz"]["home_preset"]
@@ -371,7 +446,7 @@ class PTZController:
                     self._want_pt = STOP  # watchdog: the client stopped refreshing the move
                 if self._want_zoom and now > self._zoom_deadline:
                     self._want_zoom = 0
-                want_pt, want_zoom = self._want_pt, self._want_zoom
+                want_pt, want_zoom, want_abs = self._want_pt, self._want_zoom, self._want_abs
                 oneshots = list(self._oneshots)
                 self._oneshots.clear()
             if not self.enabled:
@@ -389,7 +464,9 @@ class PTZController:
                     self._apply_zoom(0)
                 for item in oneshots:
                     self._run_oneshot(*item)
-                if want_pt != self._sent_pt:
+                if want_abs is not None and want_abs != self._sent_abs and time.monotonic() >= self._abs_retry:
+                    self._send_abs(want_abs)
+                elif want_pt != self._sent_pt:
                     self._apply_pt(want_pt)
                 if want_zoom != self._sent_zoom:
                     self._apply_zoom(want_zoom)
@@ -404,7 +481,7 @@ class PTZController:
                 if self.connected:
                     self.log.warning("PTZ command failed: %s", e)
                 self.connected = False
-                self._sent_pt = self._sent_zoom = None  # resend once the camera is reachable
+                self._sent_pt = self._sent_zoom = self._sent_abs = None  # resend once the camera is reachable
                 self._stop.wait(1.0)
 
     def _apply_pt(self, pt):
@@ -428,6 +505,7 @@ class PTZController:
     def _halt_if_moving(self):
         """PTZ was switched off: make sure the camera is not left driving or zooming."""
         with self._cond:
+            self._cancel_abs(stop_camera=True)
             self._want_pt, self._want_zoom = STOP, 0
         if self._sent_pt in (None, STOP) and not self._sent_zoom:
             return
@@ -529,6 +607,22 @@ class PTZController:
             http = ("up" if td == 1 else "down", vv, ww)
         self._cmd(b"\x01\x06\x01" + bytes([vv, ww, pd, td]), http, lenient=True)
 
+    def _send_abs(self, goal):
+        pan, tilt, vv, ww = goal
+        try:
+            self._cmd(b"\x01\x06\x02" + bytes([vv, ww]) + _nibbles(pan) + _nibbles(tilt), None)
+        except ViscaError as e:
+            if "90 60 02" in str(e):  # syntax error: this camera has no absolute pan/tilt
+                self._abs_supported = False
+                self._sent_abs = goal
+                self.log.warning("camera rejected absolute pan/tilt; following from the PTZ picture only")
+            else:  # busy (for example a preset still travelling): try again shortly
+                self._abs_retry = time.monotonic() + PT_RETRY_S
+            return
+        self._sent_abs = goal
+        self._sent_pt = STOP  # the camera is driving itself now; a later stop must be sent explicitly
+        self._af_due = time.monotonic() + self._pt_travel + 0.3
+
     def _send_zoom(self, byte):
         p = byte & 0x0F
         http = ("zoomin", p) if byte & 0xF0 == 0x20 else ("zoomout", p) if byte & 0xF0 == 0x30 else ("zoomstop", 0)
@@ -575,7 +669,8 @@ class PTZController:
         if now < self._next_poll or not self._visca_ok:
             return
         busy = self._sent_pt not in (None, STOP) or bool(self._sent_zoom) or time.time() - self.quiet_since() < 3
-        self._next_poll = now + (0.25 if not self.zoom_arrived else 0.5 if busy else 10.0)
+        goal_open = not self.zoom_arrived or not self.pt_arrived
+        self._next_poll = now + (0.2 if goal_open else 0.5 if busy else 10.0)
         try:
             r = self._visca.send(b"\x09\x04\x47")
             if r and len(r) >= 7:
@@ -586,6 +681,7 @@ class PTZController:
                 self.tilt_pos = _s16(_from_nibbles(r[6:10]))
             if self.at_home and not self.is_moving() and self.zoom_pos is not None:
                 self.home_zoom = self.zoom_pos
+                self.home_pan, self.home_tilt = self.pan_pos, self.tilt_pos
         except ViscaError as e:  # an unsupported inquiry is not a lost connection
             self.log.debug("position inquiry failed: %s", e)
 

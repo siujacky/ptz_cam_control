@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -76,30 +77,39 @@ class HailoEnhancer:
         self.h, self.w = self._model.input().shape[:2]
         self._ctx = self._model.configure()
         self._configured = self._ctx.__enter__()
+        self._lanes = threading.local()  # buffers and bindings per calling thread (one per camera)
         try:
-            self._in = np.empty((self.h, self.w, 3), np.uint8)
-            self._out = np.empty(self._model.output().shape, np.uint8)
-            self._bindings = self._configured.create_bindings(output_buffers={self._model.output().name: self._out})
+            self._lane()
         except Exception:
             self._ctx.__exit__(None, None, None)
             raise
 
+    def _lane(self):
+        lane = getattr(self._lanes, "v", None)
+        if lane is None:
+            inp = np.empty((self.h, self.w, 3), np.uint8)
+            out = np.empty(self._model.output().shape, np.uint8)
+            lane = self._lanes.v = (inp, out, self._configured.create_bindings(
+                output_buffers={self._model.output().name: out}))
+        return lane
+
     def enhance(self, frame: np.ndarray) -> np.ndarray:
         """Whole BGR frame in (any size; squeezed to the model's input), enhanced RGB at model size out.
-        The returned array is reused by the next call."""
+        The returned array is reused by this thread's next call."""
+        inp, out, bindings = self._lane()
         h, w = frame.shape[:2]
         if w >= 2 * self.w * 0.9 and h >= 2 * self.h * 0.8:
             # An exact 2x INTER_AREA averages pixels (less night grain) at a tenth of the cost of a direct
             # non-integer INTER_AREA (9 ms here); the small remaining resize is linear.
             frame = cv2.resize(frame, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
         small = cv2.resize(frame, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
-        cv2.cvtColor(small, cv2.COLOR_BGR2RGB, dst=self._in)
-        self._bindings.input().set_buffer(self._in)
+        cv2.cvtColor(small, cv2.COLOR_BGR2RGB, dst=inp)
+        bindings.input().set_buffer(inp)
         t0 = time.perf_counter()
-        self._configured.run([self._bindings], 5000)
+        self._configured.run([bindings], 5000)
         ms = (time.perf_counter() - t0) * 1000.0
         self.ms = ms if self.ms == 0 else 0.9 * self.ms + 0.1 * ms
-        return self._out
+        return out
 
     def close(self):
         self._ctx.__exit__(None, None, None)
@@ -136,13 +146,13 @@ class HailoDetector:
             self.input_h, self.input_w = self._model.input().shape[:2]
             self._ctx = self._model.configure()
             self._configured = self._ctx.__enter__()
-            self._out = np.empty(self._model.output().shape, dtype=np.float32)
-            self._bindings = self._configured.create_bindings(output_buffers={self._model.output().name: self._out})
+            # Each calling thread (one per camera) gets its own canvas and bindings: two threads then run the
+            # model at once, and the scheduler keeps the chip busy (measured 36.6 fps from one thread, 70.4 from two).
+            self._lanes = threading.local()
+            self._lane()
         except Exception:
             self._vdevice.release()
             raise
-        self._canvas = np.full((self.input_h, self.input_w, 3), 114, dtype=np.uint8)
-        self._layout = None
         self.device = self._identify()
         self.log.info("detector ready: %s on %s (input %dx%d)", self.model_name, self.device, self.input_w, self.input_h)
         if enhancer_hef:
@@ -160,31 +170,44 @@ class HailoDetector:
         except Exception:
             return "HAILO"
 
+    def _lane(self):
+        lane = getattr(self._lanes, "v", None)
+        if lane is None:
+            out = np.empty(self._model.output().shape, dtype=np.float32)
+            bindings = self._configured.create_bindings(output_buffers={self._model.output().name: out})
+            canvas = np.full((self.input_h, self.input_w, 3), 114, dtype=np.uint8)
+            lane = self._lanes.v = {"bindings": bindings, "canvas": canvas, "layout": None}
+        return lane
+
     def detect(self, frame: np.ndarray, enhanced: np.ndarray | None = None) -> list:
         """Detections in `frame` (BGR). With `enhanced` (the enhancer's RGB output for this frame), the
-        model looks at that instead; it covers the whole frame, so the geometry is the same."""
+        model looks at that instead; it covers the whole frame, so the geometry is the same. Safe to call from
+        one thread per camera at the same time."""
+        lane = self._lane()
+        canvas = lane["canvas"]
         h, w = frame.shape[:2]
         iw, ih = self.input_w, self.input_h
         s = min(iw / w, ih / h)
         nw, nh = int(round(w * s)), int(round(h * s))
         px, py = (iw - nw) // 2, (ih - nh) // 2
-        if self._layout != (nw, nh):
-            self._canvas[:] = 114  # letterbox padding only needs repainting when the layout changes
-            self._layout = (nw, nh)
+        if lane["layout"] != (nw, nh):
+            canvas[:] = 114  # letterbox padding only needs repainting when the layout changes
+            lane["layout"] = (nw, nh)
         if enhanced is not None:
-            self._canvas[py:py + nh, px:px + nw] = cv2.resize(enhanced, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            canvas[py:py + nh, px:px + nw] = cv2.resize(enhanced, (nw, nh), interpolation=cv2.INTER_LINEAR)
         else:
             resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
-            self._canvas[py:py + nh, px:px + nw] = resized[:, :, ::-1]  # BGR -> RGB
-        self._bindings.input().set_buffer(self._canvas)
+            canvas[py:py + nh, px:px + nw] = resized[:, :, ::-1]  # BGR -> RGB
+        bindings = lane["bindings"]
+        bindings.input().set_buffer(canvas)
 
         t0 = time.perf_counter()
-        self._configured.run([self._bindings], 5000)
+        self._configured.run([bindings], 5000)
         ms = (time.perf_counter() - t0) * 1000.0
         self.infer_ms = ms if self.infer_ms == 0 else 0.9 * self.infer_ms + 0.1 * ms
 
         dets = []
-        for cls, arr in enumerate(self._bindings.output().get_buffer()):
+        for cls, arr in enumerate(bindings.output().get_buffer()):
             category = CLASS_TO_CATEGORY.get(cls)
             if category is None or len(arr) == 0:
                 continue

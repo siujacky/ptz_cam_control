@@ -47,20 +47,16 @@ MATCH_IOU = 0.3
 
 
 def clone_enhancer(e):
+    """Same configured model, own buffers (lanes are per thread and per clone)."""
     c = copy.copy(e)
-    c._in = np.empty_like(e._in)
-    c._out = np.empty_like(e._out)
-    c._bindings = e._configured.create_bindings(output_buffers={e._model.output().name: c._out})
+    c._lanes = threading.local()
     return c
 
 
 def clone_detector(det):
     """Same configured model, own buffers: HailoRT runs concurrently only with separate bindings."""
     c = copy.copy(det)
-    c._canvas = np.full_like(det._canvas, 114)
-    c._layout = None
-    c._out = np.empty_like(det._out)
-    c._bindings = det._configured.create_bindings(output_buffers={det._model.output().name: c._out})
+    c._lanes = threading.local()
     return c
 
 
