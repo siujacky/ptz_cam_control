@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-STEADY_S = 10 * 60
+STEADY_S = 5 * 60  # long enough to rule out a passing break in the clouds
 MAX_WAIT_S = 48 * 3600
 ATTEMPTS = 3  # a failed calibration (the PTZ dropped off the network, a cloud mid-sweep) is tried again...
 RETRY_GAP_S = 30 * 60  # ...after this, at the next clear moment
@@ -54,8 +54,9 @@ def report(state: str, **extra):
 
 
 def clear(c: dict) -> bool:
-    # Burnt white is what spoils matching; a bright picture with little of it is fine.
-    return (c.get("online") and not c.get("blinded") and not c.get("night") and (c.get("white") or 0) < 2.0
+    # Broad burnt-white areas are what spoil matching (failover calls 50 % washed out); a bright picture with a
+    # few percent of glare (a car's windscreen, a patch of sky, which come and go as the PTZ follows someone) is fine.
+    return (c.get("online") and not c.get("blinded") and not c.get("night") and (c.get("white") or 0) < 5.0
             and 60 < (c.get("luma") or 0) < 230)
 
 
