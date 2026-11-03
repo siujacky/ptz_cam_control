@@ -49,7 +49,8 @@ LINK_RADIUS = 0.04        # a main-camera track this close to one the other came
 HANDOVER_RADIUS = 0.06    # when counting moves to the other camera, a track this close to a counted one is counted
 HANDOVER_RECENT_S = 3.0   # counted tracks the old counter saw this long before it stopped working are still in view
 COUNTED_MEMORY_S = 30.0   # each camera's counted tracks are remembered this long after it last saw them
-BAD_LEAD_S = 10.0         # a whiting-out PTZ may have stopped detecting this long before its picture was flagged
+BAD_LEAD_S = 20.0         # a whiting-out camera may have stopped detecting this long before its picture was flagged
+                          # (the PTZ's white share is smoothed over 10 s: a jump to 65 % trips it about 15 s later)
 
 
 class LiveView:
@@ -203,7 +204,8 @@ class Pipeline:
         self._uvc_refused = set()
         self._sync_pending = None  # tools/sync_when_clear.py's progress, for the status
         self._counted = {c: {} for c in CAMERAS}  # role -> track id -> _Seen: what each camera counted, lately
-        self._last_det = {}  # role -> when it last detected anything (a whiting-out picture stops detecting first)
+        self._last_det = {c: {} for c in CAMERAS}  # role -> category -> when it last detected one (a whiting-out
+                                                   # picture stops detecting people before it is flagged)
         self._counted_lock = threading.Lock()
         self._started_at = 0.0
         self._lock = threading.Lock()
@@ -388,8 +390,8 @@ class Pipeline:
                         view.levels.reset()
                     src = corrected if corrected is not None and cfg["brightness"]["detect"] else frame
                     dets = det.detect(src, enhanced if ll["detect"] else None) if det is not None else []
-                if dets:
-                    self._last_det[role] = ts
+                for d in dets:
+                    self._last_det[role][d.category] = ts
                 dt = min(max(ts - last_t, 0.0), 1.0) if last_t is not None else 0.0
                 view.white += (view.levels.white - view.white) * min(1.0, dt / WHITE_TAU_S)
                 if shown is not None:
@@ -567,21 +569,29 @@ class Pipeline:
         now = time.time()
         # Recent as of when the old counter last worked: its last picture if it went offline (seen as offline only
         # 5 s later), or when the PTZ picture went bad if it washed out (its tracks fade out with the detections).
-        ref = now
+        base = now
         age = ou.source.last_frame_age
         if not ou.online and age is not None:
-            ref = now - age
-        if old == "ptz" and self.selector.bad_since is not None:
-            # Its detections fade out before the white/blinded flags trip: from when it last detected anything, but
-            # no further back than BAD_LEAD_S before the flags.
-            last = self._last_det.get(old, ref)
-            ref = min(ref, self.selector.bad_since, max(last, self.selector.bad_since - BAD_LEAD_S))
+            base = now - age
+        bad = self.selector.bad_since if old == "ptz" else None
+        went_bad = bad is not None or ou.health().blinded
+        since = bad if bad is not None else now
+        seen = dict(self._last_det.get(old, {}))
+
+        def ref_for(cat):
+            """When the old counter last worked for this kind of object. If its picture went bad, its detections
+            faded out before the white/blinded flags tripped (people before a high-contrast parked car): from when
+            it last detected one, but no further back than BAD_LEAD_S before the flags."""
+            if not went_bad:
+                return base
+            return min(base, since, max(seen.get(cat, since), since - BAD_LEAD_S))
         with self._counted_lock:
-            done = [s for s in self._counted[old].values() if s.last_ts >= ref - HANDOVER_RECENT_S]
+            done = [s for s in self._counted[old].values() if s.last_ts >= ref_for(s.category) - HANDOVER_RECENT_S]
         fresh = [t for t in list(nu.tracker.tracks) if t.confirmed and not t.counted and now - t.last_ts < 1.0]
         if not fresh or not done:
             return 0
         # Positions that old say little about where they are now: then match by number.
+        ref = min(ref_for(s.category) for s in done)
         view = self._ptz_in_eye(cfg) if now - ref <= HANDOVER_RECENT_S else None
         pairs = []
         if view is not None:
@@ -597,11 +607,15 @@ class Pipeline:
                 if id(n) not in used and id(o) not in used:
                     used.update((id(n), id(o)))
                     pairs.append((n, o))
-        else:  # only among what the new counter could count (a parked car must not take a passer-by's count)
+        else:
+            # Only among what the new counter could count (a parked car must not take a passer-by's count), and
+            # had seen before the old counter stopped working (nobody who came later can have been counted by it).
             left = {}
             for o in sorted(done, key=lambda t: t.first_ts):
                 left.setdefault(o.category, []).append(o)
-            for n in sorted((t for t in fresh if self._could_count(t, new, cfg)), key=lambda t: t.first_ts):
+            cands = (t for t in fresh if self._could_count(t, new, cfg)
+                     and t.first_ts <= ref_for(t.category) + HANDOVER_RECENT_S)
+            for n in sorted(cands, key=lambda t: t.first_ts):
                 if left.get(n.category):
                     pairs.append((n, left[n.category].pop(0)))
         for n, o in pairs:

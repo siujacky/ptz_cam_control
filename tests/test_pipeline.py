@@ -301,7 +301,7 @@ class ReviewFixesTest(unittest.TestCase):
         now, cfg = time.time(), p.cfg.data
         # The PTZ's detections faded 3.7 s before its picture was flagged blinded (3 s ago): its last count is 6.7 s old.
         counted_by(p, "ptz", [track(5, "person", 0.5, 0.5, now - 6.7, counted=True, event_id=3)])
-        p._last_det["ptz"] = now - 6.7
+        p._last_det["ptz"] = {"person": now - 6.7}
         p.selector._blind_since = now - 3.0
         eye = p.units["eye"].tracker
         eye.tracks = [track(EYE_ID_BASE + 1, "person", 0.4, 0.5, now, first_ts=now - 9)]
@@ -311,9 +311,36 @@ class ReviewFixesTest(unittest.TestCase):
         p._counted["ptz"].clear()
         eye.tracks[0].counted = False
         counted_by(p, "ptz", [track(6, "person", 0.5, 0.5, now - 25, counted=True, event_id=2)])
-        p._last_det["ptz"] = now - 25
+        p._last_det["ptz"] = {"person": now - 25}
         self.assertEqual(p._hand_over("ptz", "eye", cfg), 0)
         self.assertFalse(eye.tracks[0].counted)
+
+    def test_a_handover_after_the_wide_camera_whites_out_remembers_what_it_counted(self):
+        p = self.stopped(eye=True)
+        now, cfg = time.time(), p.cfg.data
+        # The eye counted a walker; its picture went flat white and is flagged blinded 3.8 s after it last detected.
+        counted_by(p, "eye", [track(EYE_ID_BASE + 1, "person", 0.5, 0.5, now - 3.8, counted=True, event_id=4)])
+        p._last_det["eye"] = {"person": now - 3.8}
+        p.units["eye"].view.levels.blinded = True
+        ptz = p.units["ptz"].tracker
+        ptz.tracks = [track(7, "person", 0.4, 0.5, now, first_ts=now - 9)]
+        self.assertEqual(p._hand_over("eye", "ptz", cfg), 1)
+        self.assertEqual((ptz.tracks[0].counted, ptz.tracks[0].event_id), (True, 4))
+
+    def test_nobody_who_came_after_the_old_camera_stopped_takes_its_count(self):
+        p = self.stopped(eye=True)
+        now, cfg = time.time(), p.cfg.data
+        # The PTZ stopped detecting 15 s before its white share tripped (3 s ago); the walker it counted then left.
+        counted_by(p, "ptz", [track(5, "person", 0.5, 0.5, now - 18, counted=True, event_id=3)])
+        p._last_det["ptz"] = {"person": now - 18, "vehicle": now}  # a parked car still detected
+        p.selector._white_since = now - 3.0
+        eye = p.units["eye"].tracker
+        eye.tracks = [track(EYE_ID_BASE + 2, "person", 0.6, 0.5, now, first_ts=now - 5)]  # someone new
+        self.assertEqual(p._hand_over("ptz", "eye", cfg), 0)
+        self.assertFalse(eye.tracks[0].counted)
+        eye.tracks = [track(EYE_ID_BASE + 1, "person", 0.4, 0.5, now, first_ts=now - 30)]  # still there all along
+        self.assertEqual(p._hand_over("ptz", "eye", cfg), 1)
+        self.assertTrue(eye.tracks[0].counted)
 
     def test_a_count_handover_never_pairs_something_that_could_not_be_counted(self):
         p = self.stopped(eye=True)
