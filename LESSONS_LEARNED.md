@@ -233,7 +233,7 @@ The user mounted a fixed USB camera (an Avaya HC020) beside the PTZ camera. It c
 
 - **Sync the cameras** with `tools/calibrate_sync.py`, in daylight, with both looking at the street. `tools/sync_when_clear.py` can wait for a clear moment and run it unattended. Then check live follows driven by the wide camera, and the counts against the PTZ's history.
 - **Fit the Active Cooler** before running both cameras: the Pi read 82.6 °C with one.
-- **Storage cap.** Consider raising it from 3 GB, since the card has about 99 GB free. Then evidence is kept for more than a few hours.
+- **Storage cap.** Raised from 3 GB to 80 GB on 3 November, after the user noticed only half a day was kept. The 3 GB cap held about 10 hours: events take about 7 GB a day with both cameras. 80 GB keeps about 11 days. Keeping 30 days would need about 210 GB (a USB SSD), or keeping clips of passing cars for fewer days than everything else, since cars are about 90 % of it.
 
 - **Anti-flicker verdict.**
   - It hasn't been tested yet. The camera restarted on the morning of 1 November, and that put anti-flicker back to 50 Hz. A camera restart undoes it, so the app should re-apply it whenever the camera reconnects.

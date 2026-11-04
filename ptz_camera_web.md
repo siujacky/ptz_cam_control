@@ -179,6 +179,8 @@ tracks(id PK, event_id INTEGER NULL, track_id INTEGER, day TEXT, category TEXT, 
 - **Retention:**
   - Events and media older than `retention_days` (30) are deleted.
   - The oldest events are also deleted whenever media exceeds `max_storage_gb` (50).
+  - Whatever the cap, the oldest events also go while the disk has less than `web.MIN_FREE_GB` (5 GB) free.
+  - `/api/status` → `system` carries `disk_free_gb`, `disk_total_gb`, `media_gb` and `media_since` (the oldest event's start), so Settings can say how far back recordings go and how long the limits keep them.
   - Track rows (stats history) are kept for 365 days.
 
 ## 9. HTTP API contract

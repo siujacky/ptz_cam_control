@@ -225,6 +225,11 @@ class Storage:
     def oldest_events(self, limit: int = 20) -> list[dict]:
         return self._all("SELECT * FROM events ORDER BY start_ts LIMIT ?", (limit,))
 
+    def oldest_start(self) -> float | None:
+        """When the oldest stored event began: how far back the recordings go."""
+        row = self._one("SELECT MIN(start_ts) AS t FROM events")
+        return row["t"] if row else None
+
     # ---- tracks ----
     def insert_track(self, event_id, track_id, category, label, first_ts, counted_ts, last_ts, max_score,
                      direction, camera=None) -> int:

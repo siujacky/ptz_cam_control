@@ -45,6 +45,9 @@ class SysInfo:
     def disk_free_gb(self) -> float:
         return round(shutil.disk_usage(self.data_dir).free / 1e9, 1)
 
+    def disk_total_gb(self) -> float:
+        return round(shutil.disk_usage(self.data_dir).total / 1e9, 1)
+
     def media_gb(self, max_age=60.0) -> float:
         checked, gb = self._media
         if time.monotonic() - checked > max_age:
@@ -58,6 +61,7 @@ class SysInfo:
             "cpu_temp": self.cpu_temp(),
             "mem_percent": self.mem_percent(),
             "disk_free_gb": self.disk_free_gb(),
+            "disk_total_gb": self.disk_total_gb(),
             "media_gb": self.media_gb(),
             "load": [round(v, 2) for v in os.getloadavg()],
         }

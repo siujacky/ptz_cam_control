@@ -429,7 +429,44 @@ function renderLive(s) {
   renderEye(s);
   renderSync(s);
   renderFailover(s);
+  renderStorage(s);
   zone.setCounting(s?.counting);
+}
+
+const STORAGE_NOTE = 'Oldest events are removed first when either limit is reached. Counts are kept.';
+const KEEP_FREE_GB = 5; // the server always leaves this much of the disk free, whatever the cap (web.MIN_FREE_GB)
+
+/** A stretch of time, roughly: "40 min", "10 hours", "11 days". */
+function spanText(sec) {
+  if (sec < 90 * 60) return `${Math.max(1, Math.round(sec / 60))} min`;
+  if (sec < 2 * 86400) return `${Math.round(sec / 3600)} hours`;
+  return `${Math.round(sec / 86400)} days`;
+}
+
+/** Under the storage limits: how far back the recordings go now, and how long the limits as typed would keep them. */
+function renderStorage(s) {
+  if (!els.storageHint) return;
+  const sys = s?.system || {};
+  const media = Number(sys.media_gb);
+  const since = Number(sys.media_since);
+  const parts = [STORAGE_NOTE];
+  if (Number.isFinite(media) && since > 0) {
+    const span = Math.max(0, Number(s.time || Date.now() / 1000) - since);
+    parts.push(`Stored now: ${fmtNum(media, 1)} GB, going back ${spanText(span)}.`);
+    const perDay = span >= 3600 && media >= 0.01 ? media / (span / 86400) : null;
+    const room = Number(sys.disk_free_gb) + media - KEEP_FREE_GB; // the most the events could ever use
+    const cap = Number(els.maxGb.value);
+    const days = Number(els.retention.value);
+    if (perDay && cap > 0 && days > 0) {
+      const usable = Number.isFinite(room) ? Math.max(0, Math.min(cap, room)) : cap;
+      const keep = Math.min((usable / perDay) * 86400, days * 86400);
+      parts.push(`At about ${fmtNum(perDay, perDay < 10 ? 1 : 0)} GB a day, these limits keep about ${spanText(keep)}.`);
+    }
+    if (Number.isFinite(room) && cap > room) {
+      parts.push(`The disk has room for about ${fmtNum(Math.max(0, room), 0)} GB of events (${KEEP_FREE_GB} GB is always left free).`);
+    }
+  }
+  els.storageHint.textContent = parts.join(' ');
 }
 
 /** Copy the commands in `code`. Plain http on the LAN is not a secure context, so there is a fallback. */
@@ -522,8 +559,8 @@ function renderSystem(s) {
     item('target', 'PTZ', ptz.enabled === false ? 'Disabled' : '', ptz.enabled === false ? null : flag(!!ptz.connected, 'Connected', 'Not connected')),
     item('thermo', 'CPU temperature', num(temp, 1, ' °C'), null, tempCls),
     item('cpu', 'CPU load', `${num(sys.cpu_percent, 0)}%${Array.isArray(sys.load) ? ` · load ${sys.load.map((x) => fmtNum(x, 2)).join(' ')}` : ''}`, null),
-    item('disk', 'Disk free', num(sys.disk_free_gb, 1, ' GB'), null, Number(sys.disk_free_gb) < 5 ? 'is-warn' : ''),
-    item('image', 'Media stored', num(sys.media_gb, 2, ' GB'), null),
+    item('disk', 'Disk free', `${num(sys.disk_free_gb, 1, ' GB')}${Number(sys.disk_total_gb) > 0 ? ` of ${num(sys.disk_total_gb, 0, ' GB')}` : ''}`, null, Number(sys.disk_free_gb) < 5 ? 'is-warn' : ''),
+    item('image', 'Media stored', `${num(sys.media_gb, 2, ' GB')}${Number(sys.media_since) > 0 ? ` · last ${spanText(Math.max(0, Number(s.time || Date.now() / 1000) - sys.media_since))}` : ''}`, null),
     item('clock', 'Uptime', fmtUptime(s.uptime), null),
   ].filter(Boolean).flat());
 }
@@ -593,6 +630,9 @@ export function init() {
     failoverPill: document.getElementById('failover-pill'),
     failoverStatus: document.getElementById('failover-status'),
     version: document.getElementById('sys-version'),
+    storageHint: document.getElementById('storage-hint'),
+    maxGb: document.getElementById('f-maxgb'),
+    retention: document.getElementById('f-retention'),
   };
   buildCategoryRows();
   buildFollowCats();
@@ -603,6 +643,7 @@ export function init() {
   const onEdit = (e) => {
     const el = e.target;
     if (el.dataset?.path) syncOutput(el);
+    if (el === els.maxGb || el === els.retention) renderStorage(state.status);
     updateDirty();
   };
   els.form.addEventListener('input', onEdit);

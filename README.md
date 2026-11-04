@@ -217,7 +217,9 @@ Tools that use the AI HAT or control the camera need the service stopped first. 
 | `ptz_camera_web.md` | Design and build log |
 | `LESSONS_LEARNED.md` | What was learned building and running it |
 
-Retention: events older than 30 days are deleted automatically, and so are the oldest events once media exceeds the storage limit (50 GB by default). Counts are kept for a year. All of this can be changed in Settings.
+Retention: events older than 30 days are deleted automatically, and so are the oldest events once media exceeds the storage limit (50 GB by default). Whatever the limit, the oldest events also go when the disk has less than 5 GB free. Counts are kept for a year. All of this can be changed in Settings, which also shows how far back the recordings go and how long the limits keep them at the current rate.
+
+With both cameras on a busy street, events take about 7 GB a day (measured 2026-11-03: about 880 events, 8 MB each with the wide clip). Clips from cars alone are about 90 % of that.
 
 ## Development
 

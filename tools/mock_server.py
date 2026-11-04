@@ -1051,8 +1051,9 @@ class Mock:
                          "save_clips": ll["save_clips"]},
             "system": {"cpu_percent": round(34 + 6 * math.sin(now / 11), 1),
                        "cpu_temp": round(57.5 + 2 * math.sin(now / 23), 1),
-                       "mem_percent": 12.3, "disk_free_gb": 100.2,
+                       "mem_percent": 12.3, "disk_free_gb": 100.2, "disk_total_gb": 117.0,
                        "media_gb": round(0.0042 * len(self.store.events), 2),
+                       "media_since": min((e["start_ts"] for e in self.store.events.values()), default=None),
                        "load": [1.21, 1.04, 0.86]},
             "today": self.store.counts_for_day(local_day(now)),
         }

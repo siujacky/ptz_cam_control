@@ -112,9 +112,11 @@ def _masked(cfg: dict) -> dict:
 
 def build_status(ctx) -> dict:
     st = ctx.pipeline.status()
+    system = ctx.sysinfo.snapshot()
+    system["media_since"] = ctx.storage.oldest_start()  # how far back the stored events go
     st.update({
         "time": time.time(), "uptime": round(time.time() - ctx.started, 1), "version": __version__,
-        "system": ctx.sysinfo.snapshot(), "today": ctx.storage.counts_today(),
+        "system": system, "today": ctx.storage.counts_today(),
     })
     return st
 
@@ -134,26 +136,33 @@ def delete_event(ctx, eid: int) -> bool:
     return True
 
 
+MIN_FREE_GB = 5.0  # whatever the cap, recordings never fill the disk: the database, the system and its logs need room
+
+
 def run_retention(ctx):
     s = ctx.cfg.data["storage"]
     removed = 0
     for row in ctx.storage.events_before(time.time() - s["retention_days"] * 86400):
         removed += delete_event(ctx, row["id"])
-    cap = s["max_storage_gb"] * 1e9
-    size = dir_size(ctx.media_dir)
-    while size > cap:
+    # Bytes to free: over the cap, or short of the free-space floor (each deleted byte counts against both).
+    over_cap = dir_size(ctx.media_dir) - s["max_storage_gb"] * 1e9
+    short = MIN_FREE_GB * 1e9 - shutil.disk_usage(ctx.media_dir).free
+    if short > 0 and short > over_cap:
+        log.warning("the disk is nearly full: removing the oldest events to keep %.0f GB free", MIN_FREE_GB)
+    excess = max(over_cap, short)
+    while excess > 0:
         rows = ctx.storage.oldest_events(20)
         active = ctx.pipeline.events.active.id if ctx.pipeline.events and ctx.pipeline.events.active else None
         rows = [r for r in rows if r["id"] != active]
         if not rows:
             break
         for row in rows:
-            if size <= cap:
+            if excess <= 0:
                 break
             rel = row["snapshot"] or row["clip"]
             freed = dir_size((ctx.media_dir / rel).parent) if rel else 0
             removed += delete_event(ctx, row["id"])
-            size -= freed
+            excess -= freed
     ctx.storage.purge_tracks_before(time.time() - 365 * 86400)
     for day_dir in ctx.media_dir.iterdir():
         if day_dir.is_dir() and not any(day_dir.iterdir()):

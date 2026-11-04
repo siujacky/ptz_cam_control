@@ -893,6 +893,17 @@ def tour(browser, base: str, out: Path, name: str, opts: dict, mutate: bool, is_
         page.wait_for_function("document.getElementById('zone-img').naturalWidth > 0")
         page.wait_for_selector("#sys-grid dt")
         run.check("settings form and frame loaded", True, page.locator("#f-model").input_value())
+        # Storage: how far back the recordings go, and how long the limits as typed keep them.
+        hint = page.locator("#storage-hint").inner_text()
+        run.check("storage hint says how far back recordings go", "going back" in hint, hint)
+        stored = page.evaluate("""() => [...document.querySelectorAll('#sys-grid dt')]
+            .find((dt) => dt.textContent.includes('Media stored'))?.nextElementSibling?.textContent || ''""")
+        run.check("system panel: media stored and its span", "last" in stored, stored)
+        page.locator("#f-maxgb").fill("2000")
+        big = page.locator("#storage-hint").inner_text()
+        page.locator("#settings-discard").click()
+        page.wait_for_selector("#savebar", state="hidden")
+        run.check("a cap beyond the disk says how much room there is", "room for about" in big, big)
         # Editing shows the save bar; Discard puts things back without saving.
         page.locator("#f-clip").focus()
         page.keyboard.press("ArrowRight")
