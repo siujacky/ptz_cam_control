@@ -27,6 +27,8 @@ RETRY_GAP_S = 30 * 60  # ...after this, at the next clear moment
 # morning sun, which washes the PTZ out from about 7:00 (2026-10-31), so the early morning is often the best time.
 HOURS = (5, 18)
 POLL_S = 30
+IDLE_WAIT_S = 3 * 60  # before matching, wait this long at most for the PTZ to stop following and be back Home
+IDLE_POLL_S = 5
 
 
 def data_dir() -> Path:
@@ -66,6 +68,28 @@ def status():
         return json.load(r)
 
 
+def ptz_idle(st: dict) -> bool:
+    """The PTZ sits still at Home: not following anything, not moving, not paused by a manual move."""
+    p = st.get("ptz", {})
+    return p.get("target_id") is None and not p.get("moving") and not p.get("paused_for")
+
+
+def wait_ptz_idle(limit_s: float = IDLE_WAIT_S) -> bool:
+    """Until the PTZ has been idle on two polls in a row. When the pictures turn clear it may be following someone,
+    zoomed in, and that picture would not be found in the eye's: a false "no match" costs a quarter of an hour
+    of a morning window that lasts about one. False if it stayed busy for limit_s."""
+    end, calm = time.time() + limit_s, 0
+    while time.time() < end:
+        try:
+            calm = calm + 1 if ptz_idle(status()) else 0
+        except Exception:  # the app restarting
+            calm = 0
+        if calm >= 2:
+            return True
+        time.sleep(IDLE_POLL_S)
+    return False
+
+
 def preflight() -> bool:
     """Whether the PTZ's live picture is found in the eye's (the calibration's first step), checked on the running
     app's own pictures, so the app is only stopped when the calibration can work."""
@@ -73,6 +97,8 @@ def preflight() -> bool:
     import cv2
     import numpy as np
     from ptzcam.syncal import match_views
+    if not wait_ptz_idle():
+        print(f"preflight: the PTZ stayed busy for {IDLE_WAIT_S // 60} min; matching its picture anyway", flush=True)
     try:
         pics = []
         for cam in ("ptz", "eye"):
